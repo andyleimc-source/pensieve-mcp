@@ -13,10 +13,11 @@ also exposes archive lookups for screenshots that have been pruned locally.
 """
 from __future__ import annotations
 
+import json
 import os
-import shlex
 import subprocess
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,11 @@ TIMEOUT = 30.0
 SHOT_DIR = Path.home() / ".memos" / "screenshots"
 COS_ENV_PATH = Path.home() / ".config" / "pensieve-mcp" / "cos.env"
 COSCMD = str(Path.home() / ".local" / "bin" / "coscmd")
+MEMOS_BIN = str(Path.home() / ".local" / "bin" / "memos")
+SCRIPTS_DIR = Path(__file__).resolve().parent
+PAUSE_STATE = Path.home() / ".memos" / "pause.state"
+RESUME_PLIST = Path.home() / "Library" / "LaunchAgents" / "com.user.pensieve.resume.plist"
+RESUME_TICK = SCRIPTS_DIR / "pensieve-resume-tick.sh"
 
 mcp = FastMCP("pensieve")
 
@@ -211,6 +217,155 @@ def download_archived(entity_id: int) -> dict[str, Any]:
         "cos_key": key,
         "size_bytes": Path(tmp.name).stat().st_size,
     }
+
+
+# ── recording pause / resume ──────────────────────────────────────────────────
+
+
+def _memos_ps_record_running() -> bool:
+    try:
+        out = subprocess.run([MEMOS_BIN, "ps"], capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return False
+    for line in out.splitlines():
+        parts = line.split()
+        if parts and parts[0] == "record":
+            return len(parts) > 1 and parts[1].lower() == "running"
+    return False
+
+
+def _install_resume_agent() -> None:
+    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.user.pensieve.resume</string>
+    <key>ProgramArguments</key>
+    <array><string>{RESUME_TICK}</string></array>
+    <key>StartInterval</key><integer>60</integer>
+    <key>RunAtLoad</key><true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key><string>{Path.home()}</string>
+        <key>PATH</key><string>{Path.home()}/.local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>StandardOutPath</key><string>{Path.home()}/.memos/resume.stdout.log</string>
+    <key>StandardErrorPath</key><string>{Path.home()}/.memos/resume.stderr.log</string>
+</dict>
+</plist>
+"""
+    RESUME_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    RESUME_PLIST.write_text(plist)
+    subprocess.run(["launchctl", "unload", str(RESUME_PLIST)], capture_output=True)
+    subprocess.run(["launchctl", "load", str(RESUME_PLIST)], capture_output=True)
+
+
+def _uninstall_resume_agent() -> None:
+    if RESUME_PLIST.exists():
+        subprocess.run(["launchctl", "unload", str(RESUME_PLIST)], capture_output=True)
+        RESUME_PLIST.unlink(missing_ok=True)
+
+
+def _read_pause_state() -> dict[str, Any] | None:
+    if not PAUSE_STATE.is_file():
+        return None
+    try:
+        return json.loads(PAUSE_STATE.read_text())
+    except Exception:
+        return None
+
+
+@mcp.tool()
+def pause_recording(
+    duration_seconds: int | None = None,
+    resume_at: str | None = None,
+) -> dict[str, Any]:
+    """Pause screen recording. OCR/search/Web UI stay running.
+
+    Args:
+        duration_seconds: Pause for this many seconds, then auto-resume.
+        resume_at: Auto-resume at this absolute time (ISO 8601, e.g.
+                   "2026-04-25T18:00:00" or "2026-04-25T18:00:00+08:00").
+        Pass neither for an indefinite pause (manual resume_recording).
+        Pass at most one of the two.
+
+    A LaunchAgent ticks every minute and runs `memos start record` once
+    the resume time is reached. Survives sleep and reboot.
+    """
+    if duration_seconds is not None and resume_at is not None:
+        return {"error": "Pass at most one of duration_seconds or resume_at."}
+
+    now = datetime.now().astimezone()
+    resume_dt: datetime | None = None
+    if duration_seconds is not None:
+        if duration_seconds <= 0:
+            return {"error": "duration_seconds must be positive."}
+        resume_dt = now + timedelta(seconds=int(duration_seconds))
+    elif resume_at is not None:
+        try:
+            resume_dt = datetime.fromisoformat(resume_at)
+        except ValueError:
+            return {"error": f"Could not parse resume_at: {resume_at!r}. Use ISO 8601."}
+        if resume_dt.tzinfo is None:
+            resume_dt = resume_dt.astimezone()
+        if resume_dt <= now:
+            return {"error": "resume_at must be in the future."}
+
+    proc = subprocess.run(
+        [MEMOS_BIN, "stop", "record"], capture_output=True, text=True, timeout=15
+    )
+    state = {
+        "paused_at": now.isoformat(timespec="seconds"),
+        "resume_at": resume_dt.isoformat(timespec="seconds") if resume_dt else None,
+        "stop_output": (proc.stdout + proc.stderr).strip(),
+    }
+    PAUSE_STATE.parent.mkdir(parents=True, exist_ok=True)
+    PAUSE_STATE.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+
+    if resume_dt:
+        _install_resume_agent()
+        state["auto_resume"] = "scheduled"
+    else:
+        _uninstall_resume_agent()
+        state["auto_resume"] = "indefinite (call resume_recording to restart)"
+    return state
+
+
+@mcp.tool()
+def resume_recording() -> dict[str, Any]:
+    """Resume screen recording immediately. Cancels any scheduled auto-resume."""
+    _uninstall_resume_agent()
+    PAUSE_STATE.unlink(missing_ok=True)
+    proc = subprocess.run(
+        [MEMOS_BIN, "start", "record"], capture_output=True, text=True, timeout=15
+    )
+    return {
+        "ok": proc.returncode == 0,
+        "output": (proc.stdout + proc.stderr).strip(),
+        "record_running": _memos_ps_record_running(),
+    }
+
+
+@mcp.tool()
+def recording_status() -> dict[str, Any]:
+    """Report whether record is running, and any active pause/resume schedule."""
+    state = _read_pause_state()
+    running = _memos_ps_record_running()
+    out: dict[str, Any] = {
+        "record_running": running,
+        "paused": state is not None,
+    }
+    if state:
+        out["paused_at"] = state.get("paused_at")
+        out["resume_at"] = state.get("resume_at") or "indefinite"
+        if state.get("resume_at"):
+            try:
+                resume_dt = datetime.fromisoformat(state["resume_at"])
+                remaining = resume_dt - datetime.now().astimezone()
+                out["seconds_until_resume"] = max(0, int(remaining.total_seconds()))
+            except Exception:
+                pass
+    return out
 
 
 @mcp.tool()

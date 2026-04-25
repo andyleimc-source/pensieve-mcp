@@ -73,6 +73,9 @@ The MCP server (`scripts/pensieve-mcp.py`) exposes these tools to Claude Code:
 | `search_screenshots(query, limit?, app?)` | Semantic + keyword search. Returns up to `limit` hits with id, timestamp, app/window, and a ~800-char OCR snippet. Each hit carries `archive_status: local \| archived \| unknown`. |
 | `get_screenshot(entity_id)` | Full details + full OCR text for a single screenshot id. For archived items, returns `cos_key` instead of a usable local path. |
 | `download_archived(entity_id)` | Pull an archived screenshot from COS to a temp file. Call only when needed. |
+| `pause_recording(duration_seconds?, resume_at?)` | Stop screen recording. Optional auto-resume after duration or at ISO timestamp. Survives sleep/reboot. |
+| `resume_recording()` | Resume immediately, cancel any scheduled auto-resume. |
+| `recording_status()` | Whether record is running, plus any active pause schedule. |
 | `health()` | Ping the Pensieve REST API; reports archive configuration too. |
 
 ### Optional: cloud archive (Tencent COS)
@@ -165,7 +168,12 @@ open http://localhost:8839      # Pensieve Web UI
 | `search_screenshots(query, limit?, app?)` | 语义 + 关键词搜索。返回 id、时间、app/window、截断后的 OCR 片段；每条 hit 带 `archive_status`（local/archived/unknown）|
 | `get_screenshot(entity_id)` | 拿某张截图的完整信息（含完整 OCR 文本）；归档对象返回 `cos_key` 指向云端位置 |
 | `download_archived(entity_id)` | 按需把归档对象从 COS 拉到本地临时文件 |
+| `pause_recording(duration_seconds?, resume_at?)` | 暂停截屏。可选自动恢复（按时长或绝对时间），睡眠/重启都能正常恢复 |
+| `resume_recording()` | 立刻恢复截屏，取消计划中的自动恢复 |
+| `recording_status()` | 报告 record 进程是否运行 + 当前暂停状态 |
 | `health()` | 探活；同时报告归档功能是否启用 |
+
+直接对 Claude 说："暂停截屏 2 小时"、"暂停到明早 9 点"、"暂停一下"（无限期）都能识别。
 
 ### 可选：云归档（腾讯云 COS）
 
