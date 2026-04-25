@@ -4,6 +4,7 @@
 # dependencies = [
 #   "mcp>=1.2.0",
 #   "httpx>=0.27",
+#   "psutil>=5.9",
 # ]
 # ///
 """Pensieve MCP server. Wraps the local memos REST API at :8839.
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from collections import Counter
 from mcp.server.fastmcp import FastMCP
 
 BASE = os.environ.get("PENSIEVE_BASE_URL", "http://localhost:8839")
@@ -35,6 +37,8 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 PAUSE_STATE = Path.home() / ".memos" / "pause.state"
 RESUME_PLIST = Path.home() / "Library" / "LaunchAgents" / "com.user.pensieve.resume.plist"
 RESUME_TICK = SCRIPTS_DIR / "pensieve-resume-tick.sh"
+POWER_MODE_FILE = Path.home() / ".memos" / "power_mode.state"
+VALID_POWER_MODES = ("auto", "full_power", "forced_battery")
 
 mcp = FastMCP("pensieve")
 
@@ -81,6 +85,103 @@ def _archive_status(filepath: str | None) -> str:
     return "unknown"
 
 
+# ── time / size helpers ───────────────────────────────────────────────────────
+
+
+def _today_midnight() -> datetime:
+    return datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _parse_time(s: str | int | None) -> int | None:
+    """Parse ISO 8601 / unix int / a few relative shortcuts → unix ts.
+
+    Returns None if s is None/empty. Raises ValueError on bad input.
+    Shortcuts (case-insensitive): "today", "yesterday",
+    "today morning|afternoon|evening", "yesterday morning|afternoon|evening",
+    "this week", "last week", "last 24h", "last 7d", "last 30d", "now".
+    For ranges, this returns the *start* of the named period; pair with
+    _parse_range to get end semantics.
+    """
+    if s is None or s == "":
+        return None
+    if isinstance(s, int):
+        return s
+    s = str(s).strip()
+    if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+        return int(s)
+    try:
+        return int(datetime.fromisoformat(s).astimezone().timestamp())
+    except ValueError:
+        pass
+    raise ValueError(f"Unparseable time string: {s!r}")
+
+
+# Period definitions: (start_offset_days, hour_start, hour_end_exclusive)
+# Used by _parse_range for symbolic ranges.
+_PERIODS = {
+    "morning":   (0, 12),
+    "afternoon": (12, 18),
+    "evening":   (18, 24),
+}
+
+
+def _parse_range(start: str | int | None, end: str | int | None) -> tuple[int | None, int | None]:
+    """Resolve (start, end) — supports symbolic ranges via the start arg alone.
+
+    If `start` is a symbolic range ("today", "yesterday afternoon",
+    "last 7d", etc.) and `end` is None, both ends are derived. Otherwise
+    each is parsed independently via _parse_time.
+    """
+    if isinstance(start, str) and end is None:
+        key = start.strip().lower()
+        midnight = _today_midnight()
+        now = datetime.now().astimezone()
+
+        if key == "now":
+            return int(now.timestamp()), int(now.timestamp())
+        if key == "today":
+            return int(midnight.timestamp()), int(now.timestamp())
+        if key == "yesterday":
+            y = midnight - timedelta(days=1)
+            return int(y.timestamp()), int(midnight.timestamp())
+        if key == "this week":
+            wk_start = midnight - timedelta(days=midnight.weekday())
+            return int(wk_start.timestamp()), int(now.timestamp())
+        if key == "last week":
+            wk_start = midnight - timedelta(days=midnight.weekday() + 7)
+            wk_end = wk_start + timedelta(days=7)
+            return int(wk_start.timestamp()), int(wk_end.timestamp())
+        if key.startswith("last "):
+            tail = key[5:].strip()
+            if tail.endswith("h") and tail[:-1].isdigit():
+                hours = int(tail[:-1])
+                return int((now - timedelta(hours=hours)).timestamp()), int(now.timestamp())
+            if tail.endswith("d") and tail[:-1].isdigit():
+                days = int(tail[:-1])
+                return int((now - timedelta(days=days)).timestamp()), int(now.timestamp())
+        for prefix, base in (("today ", midnight), ("yesterday ", midnight - timedelta(days=1))):
+            if key.startswith(prefix):
+                period = key[len(prefix):].strip()
+                if period in _PERIODS:
+                    h0, h1 = _PERIODS[period]
+                    return (
+                        int((base + timedelta(hours=h0)).timestamp()),
+                        int((base + timedelta(hours=h1)).timestamp()),
+                    )
+    return _parse_time(start), _parse_time(end)
+
+
+def _maybe_warning(payload: dict[str, Any], threshold: int = 5000) -> dict[str, Any]:
+    """Add `_warning` if the JSON payload exceeds `threshold` chars."""
+    n = len(json.dumps(payload, ensure_ascii=False, default=str))
+    if n > threshold:
+        payload["_warning"] = (
+            f"result is large (~{n // 1000}KB). For overviews use activity_summary; "
+            "for narrower searches add a time range or smaller limit."
+        )
+    return payload
+
+
 # ── tools ─────────────────────────────────────────────────────────────────────
 
 
@@ -105,13 +206,10 @@ def _meta_get(metadata_entries: list[dict], key: str) -> str:
     return ""
 
 
-def _summarize_hit(doc: dict) -> dict[str, Any]:
+def _summarize_hit(doc: dict, include_ocr: bool = True) -> dict[str, Any]:
     meta = doc.get("metadata_entries") or []
-    ocr = _extract_ocr_text(meta)
-    if len(ocr) > 800:
-        ocr = ocr[:800] + "…"
     fp = doc.get("filepath")
-    return {
+    out = {
         "id": doc.get("id"),
         "filepath": fp,
         "archive_status": _archive_status(fp),
@@ -120,8 +218,13 @@ def _summarize_hit(doc: dict) -> dict[str, Any]:
         "window": _meta_get(meta, "active_window"),
         "screen": _meta_get(meta, "screen_name"),
         "url": _meta_get(meta, "url"),
-        "ocr_text": ocr,
     }
+    if include_ocr:
+        ocr = _extract_ocr_text(meta)
+        if len(ocr) > 800:
+            ocr = ocr[:800] + "…"
+        out["ocr_text"] = ocr
+    return out
 
 
 @mcp.tool()
@@ -129,38 +232,78 @@ def search_screenshots(
     query: str,
     limit: int = 10,
     app: str | None = None,
+    start: str | int | None = None,
+    end: str | int | None = None,
+    include_ocr: bool | None = None,
 ) -> dict[str, Any]:
     """Search the user's screen history by semantic + keyword query.
 
+    Prefer this over raw REST whenever filtering by time. For "what did I do
+    on X" overview questions use activity_summary instead — it returns a
+    compact aggregate, not raw hits.
+
     Args:
-        query: What to search for (e.g. "supabase billing", "上周的账单讨论").
-        limit: Max results to return (default 10, max 50).
-        app: Optional app name filter (e.g. "iTerm2", "微信", "Chrome").
+        query: Semantic + keyword query. Pass "" to list newest entities in
+               the time range without scoring.
+        limit: Max results (default 10, max 200).
+        app: Optional app filter (e.g. "iTerm2", "Chrome", "微信").
+        start: Time-range start. Accepts ISO 8601 ("2026-04-25",
+               "2026-04-25T13:00"), a unix-ts int, or a symbolic range when
+               `end` is omitted: "today", "yesterday",
+               "today afternoon" / "yesterday morning|afternoon|evening",
+               "this week", "last week", "last 24h", "last 7d", "last 30d".
+        end: Time-range end (ISO 8601 / unix int). Ignored when `start` is a
+             symbolic range.
+        include_ocr: If False, omit ocr_text from each hit (saves bandwidth).
+                     Defaults to True for limit ≤ 20, False otherwise.
 
     Hits include `archive_status`: "local" (image on disk),
     "archived" (image in COS — call download_archived to fetch),
     or "unknown".
     """
-    limit = max(1, min(int(limit), 50))
-    params = {"q": query, "limit": limit, "library_ids": LIBRARY_ID}
+    limit = max(1, min(int(limit), 200))
+    if include_ocr is None:
+        include_ocr = limit <= 20
+
+    s_ts, e_ts = _parse_range(start, end)
+    params: dict[str, Any] = {"q": query, "limit": limit, "library_ids": LIBRARY_ID}
     if app:
         params["app_names"] = app
+    if s_ts is not None:
+        params["start"] = s_ts
+    if e_ts is not None:
+        params["end"] = e_ts
     r = httpx.get(f"{BASE}/api/search", params=params, timeout=TIMEOUT)
     r.raise_for_status()
     data = r.json()
-    return {
+    out: dict[str, Any] = {
         "found": data.get("found", 0),
         "returned": len(data.get("hits", [])),
-        "hits": [_summarize_hit(h.get("document", {})) for h in data.get("hits", [])],
+        "include_ocr": include_ocr,
+        "hits": [
+            _summarize_hit(h.get("document", {}), include_ocr=include_ocr)
+            for h in data.get("hits", [])
+        ],
     }
+    if s_ts is not None or e_ts is not None:
+        out["time_range"] = {"start": s_ts, "end": e_ts}
+    return _maybe_warning(out)
 
 
 @mcp.tool()
-def get_screenshot(entity_id: int) -> dict[str, Any]:
-    """Fetch full details for one screenshot by id (including full OCR text).
+def get_screenshot(entity_id: int, max_chars: int = 2000) -> dict[str, Any]:
+    """Fetch full details for one screenshot by id.
 
-    If the image has been archived to COS (local file gone), `archive_status`
-    will be "archived" and `cos_key` indicates where it lives.
+    Args:
+        entity_id: Pensieve entity id.
+        max_chars: Truncate `ocr_text_full` to this many characters
+                   (default 2000). Pass 0 for no truncation. When
+                   truncated, `ocr_text_truncated` is set to True and
+                   `ocr_text_full_chars` holds the original length.
+
+    If the image has been archived to COS (local file gone),
+    `archive_status` will be "archived" and `cos_key` indicates where
+    it lives.
     """
     r = httpx.get(f"{BASE}/api/entities/{int(entity_id)}", timeout=TIMEOUT)
     r.raise_for_status()
@@ -168,6 +311,12 @@ def get_screenshot(entity_id: int) -> dict[str, Any]:
     meta = doc.get("metadata_entries") or []
     fp = doc.get("filepath")
     status = _archive_status(fp)
+    full_ocr = _extract_ocr_text(meta)
+    truncated = False
+    full_len = len(full_ocr)
+    if max_chars and full_len > max_chars:
+        full_ocr = full_ocr[:max_chars] + "…"
+        truncated = True
     out: dict[str, Any] = {
         "id": doc.get("id"),
         "filepath": fp,
@@ -178,7 +327,9 @@ def get_screenshot(entity_id: int) -> dict[str, Any]:
         "screen": _meta_get(meta, "screen_name"),
         "url": _meta_get(meta, "url"),
         "tags": doc.get("tags") or [],
-        "ocr_text_full": _extract_ocr_text(meta),
+        "ocr_text_full": full_ocr,
+        "ocr_text_truncated": truncated,
+        "ocr_text_full_chars": full_len,
     }
     if status == "archived":
         out["cos_bucket"] = COS["COS_BUCKET"] if COS else None
@@ -217,6 +368,136 @@ def download_archived(entity_id: int) -> dict[str, Any]:
         "cos_key": key,
         "size_bytes": Path(tmp.name).stat().st_size,
     }
+
+
+# ── activity summary ──────────────────────────────────────────────────────────
+
+
+_SCAN_PAGE_LIMIT = 200  # /api/search caps limit at 200, no offset.
+
+
+def _scan_entities(s_ts: int, e_ts: int) -> list[dict]:
+    """Return all entities in [s_ts, e_ts]. Subdivides time when a window
+    saturates the 200-row API cap. Returns raw `document` dicts.
+    """
+    docs: list[dict] = []
+    seen: set[int] = set()
+    stack: list[tuple[int, int]] = [(s_ts, e_ts)]
+    # Bound iterations defensively.
+    for _ in range(2000):
+        if not stack:
+            break
+        a, b = stack.pop()
+        if b <= a:
+            continue
+        r = httpx.get(
+            f"{BASE}/api/search",
+            params={"q": "", "limit": _SCAN_PAGE_LIMIT, "library_ids": LIBRARY_ID,
+                    "start": a, "end": b},
+            timeout=TIMEOUT,
+        )
+        r.raise_for_status()
+        hits = r.json().get("hits", []) or []
+        if len(hits) >= _SCAN_PAGE_LIMIT and (b - a) > 1:
+            mid = (a + b) // 2
+            # Avoid an infinite split at degenerate ranges.
+            if mid > a and mid < b:
+                stack.append((a, mid))
+                stack.append((mid + 1, b))
+                continue
+        for h in hits:
+            doc = h.get("document") or {}
+            did = doc.get("id")
+            if did is None or did in seen:
+                continue
+            seen.add(did)
+            docs.append(doc)
+    return docs
+
+
+@mcp.tool()
+def activity_summary(
+    start: str | int | None = "today",
+    end: str | int | None = None,
+    group_by: str = "app",
+    top_n: int = 10,
+) -> dict[str, Any]:
+    """Compact aggregate of screen activity over a time range.
+
+    Use this — not search_screenshots — for "what was I doing on X" style
+    questions. Returns counts only; no OCR text, no per-shot detail.
+
+    Args:
+        start: Range start. Same syntax as search_screenshots.start; defaults
+               to "today". Symbolic ranges ("today afternoon", "yesterday",
+               "last 7d") fill in the end automatically.
+        end: Range end. Ignored if `start` is symbolic.
+        group_by: "app" | "window" | "hour" | "all"
+                  - "app":    top apps by screenshot count
+                  - "window": top window titles
+                  - "hour":   per-hour bucket with top app
+                  - "all":    apps + windows + hourly
+        top_n: How many top apps/windows to return (default 10, max 50).
+    """
+    top_n = max(1, min(int(top_n), 50))
+    if group_by not in ("app", "window", "hour", "all"):
+        return {"error": f"invalid group_by: {group_by!r}",
+                "valid": ["app", "window", "hour", "all"]}
+
+    s_ts, e_ts = _parse_range(start, end)
+    if s_ts is None or e_ts is None:
+        return {"error": "could not resolve time range", "start": start, "end": end}
+    if e_ts <= s_ts:
+        return {"error": "end must be after start", "start": s_ts, "end": e_ts}
+
+    docs = _scan_entities(s_ts, e_ts)
+    total = len(docs)
+
+    app_counts: Counter[str] = Counter()
+    window_counts: Counter[str] = Counter()
+    hourly: dict[str, Counter[str]] = {}
+
+    for doc in docs:
+        meta = doc.get("metadata_entries") or []
+        app = _meta_get(meta, "active_app") or "(unknown)"
+        win = _meta_get(meta, "active_window") or "(unknown)"
+        app_counts[app] += 1
+        window_counts[win] += 1
+        ts = doc.get("file_created_at")
+        if ts:
+            try:
+                dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone()
+                bucket = dt.strftime("%Y-%m-%dT%H:00")
+                hourly.setdefault(bucket, Counter())[app] += 1
+            except ValueError:
+                pass
+
+    out: dict[str, Any] = {
+        "total_shots": total,
+        "time_range": {
+            "start": s_ts,
+            "end": e_ts,
+            "start_iso": datetime.fromtimestamp(s_ts).astimezone().isoformat(timespec="seconds"),
+            "end_iso": datetime.fromtimestamp(e_ts).astimezone().isoformat(timespec="seconds"),
+        },
+        "group_by": group_by,
+    }
+    if group_by in ("app", "all"):
+        out["top_apps"] = [{"app": a, "count": c}
+                           for a, c in app_counts.most_common(top_n)]
+    if group_by in ("window", "all"):
+        out["top_windows"] = [{"window": w, "count": c}
+                              for w, c in window_counts.most_common(top_n)]
+    if group_by in ("hour", "all"):
+        out["hourly"] = [
+            {
+                "hour": h,
+                "count": sum(c.values()),
+                "top_app": c.most_common(1)[0][0] if c else None,
+            }
+            for h, c in sorted(hourly.items())
+        ]
+    return out
 
 
 # ── recording pause / resume ──────────────────────────────────────────────────
@@ -379,6 +660,124 @@ def health() -> dict[str, Any]:
         "archive_device": COS.get("PENSIEVE_DEVICE") if COS else None,
         "archive_bucket": COS.get("COS_BUCKET") if COS else None,
     }
+
+
+# ── power mode (battery throttle override) ───────────────────────────────────
+
+
+def _read_power_mode() -> str:
+    """Return the current override mode: auto / full_power / forced_battery."""
+    try:
+        if POWER_MODE_FILE.is_file():
+            mode = POWER_MODE_FILE.read_text().strip()
+            if mode in VALID_POWER_MODES:
+                return mode
+    except Exception:
+        pass
+    return "auto"
+
+
+def _battery_snapshot() -> dict[str, Any]:
+    """psutil battery info, normalized."""
+    try:
+        import psutil
+        b = psutil.sensors_battery()
+    except Exception:
+        return {"available": False}
+    if b is None:
+        return {"available": False}
+    secs = b.secsleft
+    return {
+        "available": True,
+        "battery_percent": round(b.percent, 1),
+        "power_plugged": bool(b.power_plugged),
+        "secs_left": None if secs in (-1, -2) else int(secs),
+        "actual_on_battery": not b.power_plugged,
+    }
+
+
+@mcp.tool()
+def set_power_mode(mode: str) -> dict[str, Any]:
+    """Override Pensieve's battery-throttle behavior.
+
+    Pensieve normally slows OCR/embedding ingestion when on battery (doubles
+    processing interval, blocks idle catch-up, stops background scans). This
+    tool lets you override that.
+
+    Args:
+        mode: One of:
+          - "auto"           — default; honor real battery state via psutil
+          - "full_power"     — pretend always plugged in; full-speed ingest
+                               regardless of battery (drains battery faster)
+          - "forced_battery" — pretend always on battery; max throttle (mostly
+                               for debugging the throttle logic)
+
+    Takes effect within ~60s (watch loop's battery-cache TTL). Survives memos
+    restart (state lives in ~/.memos/power_mode.state).
+    """
+    if mode not in VALID_POWER_MODES:
+        return {"error": "invalid mode", "given": mode, "valid": list(VALID_POWER_MODES)}
+    try:
+        if mode == "auto":
+            POWER_MODE_FILE.unlink(missing_ok=True)
+        else:
+            POWER_MODE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            POWER_MODE_FILE.write_text(mode)
+    except Exception as e:
+        return {"error": f"failed to update power mode file: {e}"}
+
+    snap = _battery_snapshot()
+    return {
+        "mode": mode,
+        "state_file": str(POWER_MODE_FILE),
+        "effective_within_seconds": 60,
+        "actual_battery": snap,
+        "note": (
+            "watch loop refreshes battery state every 60s; new mode takes effect "
+            "within that window without needing memos restart."
+        ),
+    }
+
+
+@mcp.tool()
+def get_power_mode() -> dict[str, Any]:
+    """Report the current power-mode override + actual battery state.
+
+    Use this to diagnose whether Pensieve is throttling ingest. If
+    `throttling_active=true` and `mode=auto`, you're on battery and watch
+    is doubling its processing interval — set mode=full_power to override.
+    """
+    mode = _read_power_mode()
+    snap = _battery_snapshot()
+
+    actual = snap.get("actual_on_battery") if snap.get("available") else False
+    if mode == "full_power":
+        effective = False
+    elif mode == "forced_battery":
+        effective = True
+    else:
+        effective = bool(actual)
+
+    return {
+        "mode": mode,
+        "state_file_exists": POWER_MODE_FILE.is_file(),
+        "actual_on_battery": actual if snap.get("available") else None,
+        "effective_on_battery": effective,
+        "throttling_active": effective,
+        "battery": snap,
+    }
+
+
+@mcp.tool()
+def toggle_full_power() -> dict[str, Any]:
+    """Convenience two-state toggle: full_power ↔ auto.
+
+    If currently in full_power → switch to auto.
+    Otherwise (auto or forced_battery) → switch to full_power.
+    Returns the same shape as set_power_mode.
+    """
+    new_mode = "auto" if _read_power_mode() == "full_power" else "full_power"
+    return set_power_mode(new_mode)
 
 
 if __name__ == "__main__":
