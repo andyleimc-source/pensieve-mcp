@@ -66,13 +66,20 @@ Then in a **new** Claude Code session, ask:
 
 ### MCP tools exposed
 
-The MCP server (`scripts/pensieve-mcp.py`) exposes three tools to Claude Code:
+The MCP server (`scripts/pensieve-mcp.py`) exposes these tools to Claude Code:
 
 | Tool | Purpose |
 |---|---|
-| `search_screenshots(query, limit?, app?)` | Semantic + keyword search. Returns up to `limit` hits with id, timestamp, app/window, and a ~800-char OCR snippet. |
-| `get_screenshot(entity_id)` | Full details + full OCR text for a single screenshot id. |
-| `health()` | Ping the Pensieve REST API. |
+| `search_screenshots(query, limit?, app?)` | Semantic + keyword search. Returns up to `limit` hits with id, timestamp, app/window, and a ~800-char OCR snippet. Each hit carries `archive_status: local \| archived \| unknown`. |
+| `get_screenshot(entity_id)` | Full details + full OCR text for a single screenshot id. For archived items, returns `cos_key` instead of a usable local path. |
+| `download_archived(entity_id)` | Pull an archived screenshot from COS to a temp file. Call only when needed. |
+| `health()` | Ping the Pensieve REST API; reports archive configuration too. |
+
+### Optional: cloud archive (Tencent COS)
+
+By default, screenshots older than 90 days are deleted locally. Enable cloud archive during `./install.sh` (step 6) to upload them to a Tencent Cloud COS bucket instead — they stay searchable through the MCP, only the image bytes move to the cloud. ~¥1–3/month per 100GB.
+
+See [docs/cos-archive.md](docs/cos-archive.md) for the full setup (bucket, CAM sub-account, policy) and how it interacts with the MCP.
 
 ### Uninstall
 
@@ -155,9 +162,16 @@ open http://localhost:8839      # Pensieve Web UI
 
 | 工具 | 作用 |
 |---|---|
-| `search_screenshots(query, limit?, app?)` | 语义 + 关键词搜索。返回 id、时间、app/window、截断后的 OCR 片段 |
-| `get_screenshot(entity_id)` | 拿某张截图的完整信息（含完整 OCR 文本） |
-| `health()` | 探活 |
+| `search_screenshots(query, limit?, app?)` | 语义 + 关键词搜索。返回 id、时间、app/window、截断后的 OCR 片段；每条 hit 带 `archive_status`（local/archived/unknown）|
+| `get_screenshot(entity_id)` | 拿某张截图的完整信息（含完整 OCR 文本）；归档对象返回 `cos_key` 指向云端位置 |
+| `download_archived(entity_id)` | 按需把归档对象从 COS 拉到本地临时文件 |
+| `health()` | 探活；同时报告归档功能是否启用 |
+
+### 可选：云归档（腾讯云 COS）
+
+默认行为是 90 天外的截图本地直接删。在 `./install.sh` 第 6 步可以选启用云归档——超期截图先传到你私人的 COS 桶再删本地，**搜索照常工作**（OCR 文本和向量在本地 SQLite，没动），只是图片本体上云。100GB 一年 ~¥10-30。
+
+详见 [docs/cos-archive.md](docs/cos-archive.md)：建桶、CAM 子账号、最小权限策略、和 MCP 怎么联动。
 
 ### 卸载
 

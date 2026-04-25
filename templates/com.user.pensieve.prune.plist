@@ -6,7 +6,7 @@
     <string>com.user.pensieve.prune</string>
     <key>ProgramArguments</key>
     <array>
-        <string>__REPO__/scripts/prune-screenshots.sh</string>
+        <string>__CRON_SCRIPT__</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>

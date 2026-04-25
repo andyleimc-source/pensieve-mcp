@@ -55,6 +55,28 @@ Upstream estimates ~8GB/month at 2560x1440, 10h/day. Tune:
 - Dedup aggressiveness: lower `--threshold` for `memos record` (default 4)
 - Retention: `RETAIN_DAYS=30 ./install.sh` to re-provision LaunchAgent at 30 days
 
+## Archive: MCP search returns no results after archiving
+
+You probably ran `memos scan` after archive started, which deleted the DB rows for archived files. Recovery:
+
+1. Stop running `memos scan`
+2. Re-add metadata only by re-uploading? No — once DB rows are gone, OCR/vector are gone with them. You'd have to re-OCR from the archived images, which means downloading them all back, then `memos scan`. Cheaper to live with the loss going forward.
+
+## Archive: `coscmd upload` fails with permission errors
+
+Re-check the CAM policy resource ARN format — must be exactly:
+
+```
+qcs::cos:<region>:uid/<APPID>:<bucket>/*
+qcs::cos:<region>:uid/<APPID>:<bucket>
+```
+
+Region must match the bucket region. APPID is the trailing number in the bucket name. Both lines (with and without `/*`) are needed — `GetBucket` (list) requires the bucket-level resource.
+
+## Archive: object is "thawing" / `403 RestoreObject`
+
+The lifecycle rule transitions to Archive after 30 days, where retrieval requires restore (a few minutes to hours). Use `coscmd restore` or the console to start a restore, wait, then download. To avoid this, change the lifecycle rule to "low-frequency" (cheaper than Standard but instant retrieval).
+
 ## `claude mcp list` shows pensieve but `✗ Failed to connect`
 
 ```bash

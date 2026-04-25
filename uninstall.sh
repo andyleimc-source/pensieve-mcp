@@ -25,7 +25,7 @@ fi
 step "3/4  Stop memos services"
 memos stop 2>/dev/null && c_green "stopped" || c_yellow "not running (skipped)"
 
-step "4/4  (Optional) uninstall the memos tool"
+step "4/5  (Optional) uninstall the memos tool"
 read -r -p "Run 'uv tool uninstall memos'? [y/N] " ans
 if [[ "${ans:-}" =~ ^[Yy]$ ]]; then
   uv tool uninstall memos || true
@@ -34,9 +34,23 @@ else
   c_yellow "keeping memos tool installed"
 fi
 
+step "5/5  (Optional) remove COS archive credentials"
+COS_ENV="${HOME}/.config/pensieve-mcp/cos.env"
+if [[ -f "${COS_ENV}" ]]; then
+  read -r -p "Delete ${COS_ENV}? [y/N] " ans
+  if [[ "${ans:-}" =~ ^[Yy]$ ]]; then
+    rm -f "${COS_ENV}" "${HOME}/.cos.conf"
+    c_green "credentials removed"
+  else
+    c_yellow "kept ${COS_ENV}"
+  fi
+fi
+
 cat <<EOF
 
-Done. Your data at ~/.memos/ is untouched.
-To also remove your screenshots and SQLite DB:
-    rm -rf ~/.memos
+Done. Your local data at ~/.memos/ is untouched.
+Your COS bucket (if you used cloud archive) is untouched too — manage it from
+the Tencent Cloud console.
+
+To wipe local data:    rm -rf ~/.memos
 EOF
