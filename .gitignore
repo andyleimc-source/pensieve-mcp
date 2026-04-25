@@ -1,0 +1,13 @@
+.DS_Store
+*.log
+*.pyc
+__pycache__/
+.venv/
+/tmp/
+
+# defensive — private development notes that must never land here
+CLAUDE.md
+handoff.md
+progress.md
+decision.md
+bug.md
