@@ -4,28 +4,38 @@
 # Does NOT delete ~/.memos/ — your screenshots and DB are safe.
 set -euo pipefail
 
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLIST_DST="${HOME}/Library/LaunchAgents/com.user.pensieve.prune.plist"
+RESUME_PLIST="${HOME}/Library/LaunchAgents/com.user.pensieve.resume.plist"
+PMCP_ENV_DIR="${HOME}/.config/pensieve-mcp"
 
 c_green() { printf "\033[32m%s\033[0m\n" "$*"; }
 c_yellow() { printf "\033[33m%s\033[0m\n" "$*"; }
 step() { printf "\n\033[1;36m==> %s\033[0m\n" "$*"; }
 
-step "1/4  Unregister MCP server from Claude Code"
+step "1/6  Unregister MCP server from Claude Code"
 claude mcp remove pensieve -s user 2>/dev/null && c_green "removed" || c_yellow "not registered (skipped)"
 
-step "2/4  Unload and remove LaunchAgent"
-if [[ -f "${PLIST_DST}" ]]; then
-  launchctl unload "${PLIST_DST}" 2>/dev/null || true
-  rm -f "${PLIST_DST}"
-  c_green "removed ${PLIST_DST}"
-else
-  c_yellow "no LaunchAgent found (skipped)"
-fi
+step "2/6  Unload and remove LaunchAgents (prune + resume)"
+for p in "${PLIST_DST}" "${RESUME_PLIST}"; do
+  if [[ -f "${p}" ]]; then
+    launchctl unload "${p}" 2>/dev/null || true
+    rm -f "${p}"
+    c_green "removed ${p}"
+  fi
+done
 
-step "3/4  Stop memos services"
+step "3/6  Stop memos services"
 memos stop 2>/dev/null && c_green "stopped" || c_yellow "not running (skipped)"
 
-step "4/5  (Optional) uninstall the memos tool"
+step "4/6  Revert pensieve-mcp patches in memos site-packages"
+if [[ -x "${REPO_DIR}/scripts/apply-patches.sh" ]]; then
+  "${REPO_DIR}/scripts/apply-patches.sh" --revert || c_yellow "revert reported issues (ok if you'll uninstall memos next)"
+else
+  c_yellow "apply-patches.sh missing (skipped)"
+fi
+
+step "5/6  (Optional) uninstall the memos tool"
 read -r -p "Run 'uv tool uninstall memos'? [y/N] " ans
 if [[ "${ans:-}" =~ ^[Yy]$ ]]; then
   uv tool uninstall memos || true
@@ -34,16 +44,22 @@ else
   c_yellow "keeping memos tool installed"
 fi
 
-step "5/5  (Optional) remove COS archive credentials"
-COS_ENV="${HOME}/.config/pensieve-mcp/cos.env"
-if [[ -f "${COS_ENV}" ]]; then
-  read -r -p "Delete ${COS_ENV}? [y/N] " ans
-  if [[ "${ans:-}" =~ ^[Yy]$ ]]; then
-    rm -f "${COS_ENV}" "${HOME}/.cos.conf"
-    c_green "credentials removed"
-  else
-    c_yellow "kept ${COS_ENV}"
+step "6/6  (Optional) remove pensieve-mcp credentials"
+for env_file in "${PMCP_ENV_DIR}/auth.env" "${PMCP_ENV_DIR}/cos.env"; do
+  if [[ -f "${env_file}" ]]; then
+    read -r -p "Delete ${env_file}? [y/N] " ans
+    if [[ "${ans:-}" =~ ^[Yy]$ ]]; then
+      rm -f "${env_file}"
+      c_green "removed ${env_file}"
+    else
+      c_yellow "kept ${env_file}"
+    fi
   fi
+done
+# coscmd's own config (only relevant if cos.env was deleted)
+if [[ ! -f "${PMCP_ENV_DIR}/cos.env" && -f "${HOME}/.cos.conf" ]]; then
+  read -r -p "Delete ${HOME}/.cos.conf (coscmd config)? [y/N] " ans
+  [[ "${ans:-}" =~ ^[Yy]$ ]] && rm -f "${HOME}/.cos.conf" && c_green "removed"
 fi
 
 cat <<EOF

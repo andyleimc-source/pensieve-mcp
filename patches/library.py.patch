@@ -1,0 +1,25 @@
+--- memos/cmds/library.py
++++ memos/cmds/library.py
+@@ -731,8 +731,22 @@
+             raise typer.Exit(code=1)
+
+
++_POWER_MODE_FILE = Path.home() / ".memos" / "power_mode.state"
++
++
+ @lru_cache(maxsize=1)
+ def is_on_battery():
++    # User override at ~/.memos/power_mode.state takes precedence over psutil
++    try:
++        if _POWER_MODE_FILE.is_file():
++            mode = _POWER_MODE_FILE.read_text().strip()
++            if mode == "full_power":
++                return False
++            if mode == "forced_battery":
++                return True
++            # any other content / "auto" → fall through
++    except Exception:
++        pass
+     try:
+         battery = psutil.sensors_battery()
+         return battery is not None and not battery.power_plugged

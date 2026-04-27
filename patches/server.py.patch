@@ -1,0 +1,40 @@
+--- memos/server.py
++++ memos/server.py
+@@ -70,6 +70,37 @@
+
+ app = FastAPI()
+
++# ── Bearer token auth for non-localhost access ─────────────────────────────
++# Patch by pensieve-setup. Reads ~/.config/pensieve-mcp/auth.env (PENSIEVE_TOKEN=...).
++# Localhost is always allowed (Web UI, local curl). Tailnet/LAN must send
++# `Authorization: Bearer <token>`. If the file is missing, auth is disabled
++# (falls back to legacy 0.0.0.0 behavior).
++import os as _pensieve_os
++_PENSIEVE_TOKEN_FILE = _pensieve_os.path.expanduser("~/.config/pensieve-mcp/auth.env")
++_PENSIEVE_API_TOKEN = None
++if _pensieve_os.path.isfile(_PENSIEVE_TOKEN_FILE):
++    try:
++        with open(_PENSIEVE_TOKEN_FILE) as _f:
++            for _line in _f:
++                _line = _line.strip()
++                if _line.startswith("PENSIEVE_TOKEN="):
++                    _PENSIEVE_API_TOKEN = _line.split("=", 1)[1].strip().strip('"').strip("'") or None
++                    break
++    except Exception:
++        _PENSIEVE_API_TOKEN = None
++
++@app.middleware("http")
++async def _pensieve_bearer_auth(request, call_next):
++    if _PENSIEVE_API_TOKEN:
++        client_host = request.client.host if request.client else ""
++        if client_host not in ("127.0.0.1", "::1", "localhost", ""):
++            auth = request.headers.get("authorization", "")
++            if auth != f"Bearer {_PENSIEVE_API_TOKEN}":
++                from fastapi.responses import JSONResponse
++                return JSONResponse({"detail": "unauthorized"}, status_code=401)
++    return await call_next(request)
++# ───────────────────────────────────────────────────────────────────────────
++
+ logfire.configure(send_to_logfire="if-token-present")
+ logfire.instrument_fastapi(app, excluded_urls=["/files"])
+

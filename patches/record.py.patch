@@ -1,0 +1,11 @@
+--- memos/record.py
++++ memos/record.py
+@@ -141,6 +141,8 @@
+     if displays_info is None:
+         logging.error("Unable to find display information")
+         return
++
++    displays_info = [d for d in displays_info if d.get("spdisplays_mirror_status") != "spdisplays_hardware_mirror"]
+
+     screen_names = {}
+

@@ -113,17 +113,39 @@ Notes:
 - Peer queries skip httpx's auto-proxy detection (`trust_env=False`), since macOS system proxies (Clash/V2Ray) tend to break Tailscale CGNAT routing.
 - Configure on **each** Mac symmetrically and you get bidirectional aggregation — querying either machine searches both.
 
-### Optional: API authentication
+### API authentication
 
-By default, Pensieve's REST API on `:8839` is unauthenticated. That's fine for pure localhost use, but **dangerous if you expose it to a LAN or Tailnet** (which `PENSIEVE_PEERS` requires). To enable Bearer-token auth on the MCP side, drop the token into:
+By default, Pensieve's REST API on `:8839` is unauthenticated. That's fine for pure localhost use, but **dangerous if you expose it to a LAN or Tailnet** (which `PENSIEVE_PEERS` requires).
+
+`./install.sh` step 7 offers to generate a token for you. If you skipped it, or want to enable auth later:
 
 ```bash
-mkdir -p ~/.config/pensieve-mcp
-echo 'PENSIEVE_TOKEN=your-long-random-token' > ~/.config/pensieve-mcp/auth.env
+mkdir -p ~/.config/pensieve-mcp && chmod 700 ~/.config/pensieve-mcp
+printf "PENSIEVE_TOKEN=%s\n" "$(openssl rand -hex 32)" > ~/.config/pensieve-mcp/auth.env
 chmod 600 ~/.config/pensieve-mcp/auth.env
+memos stop && memos start    # server.py middleware reads the file at boot
 ```
 
-The MCP will send `Authorization: Bearer <token>` on every request to local Pensieve and to any peers. You're responsible for configuring the matching auth check on the Pensieve server side (e.g. via a reverse proxy or a custom middleware) — this kit only handles the **client** side.
+How it works end-to-end:
+- **Server side** — `patches/server.py.patch` (applied by `./scripts/apply-patches.sh`, which `install.sh` invokes) installs a FastAPI middleware that, when `auth.env` is present, returns `401` on any non-localhost request lacking `Authorization: Bearer <token>`. Localhost (`127.0.0.1`, `::1`) is always allowed so the Web UI keeps working.
+- **Client side** — the MCP reads the same `auth.env` and sends `Authorization: Bearer <token>` on every request to local Pensieve and to any `PENSIEVE_PEERS`.
+
+For multi-device, write the **same** token to `auth.env` on every machine. Mismatched tokens silently break peer queries.
+
+### Upgrading
+
+When upstream Pensieve releases a new version:
+
+```bash
+memos stop
+uv tool upgrade memos --with "transformers<5"
+./scripts/apply-patches.sh        # re-apply the three site-packages patches
+memos start
+```
+
+`uv tool upgrade` (and `uv tool install --force`) wipe site-packages, removing the auth middleware, the power-mode override, and the mirror-display filter. `apply-patches.sh` is idempotent and detects upstream drift — if a patch fails after an upgrade, please open an issue.
+
+To verify state at any time: `./scripts/apply-patches.sh --check`.
 
 ### Uninstall
 
@@ -251,17 +273,39 @@ peer 来的结果会带 `source=<hostname>` 标签；本地命中标 `source=loc
 - peer 查询会跳过 httpx 的自动代理探测（`trust_env=False`），因为 macOS 系统代理（Clash/V2Ray）一般不会路由 Tailscale CGNAT 段，会反 502
 - 两台机器**对称**配置就能双向聚合——查任一台都搜两台
 
-### 可选：API 鉴权
+### API 鉴权
 
-Pensieve 的 `:8839` REST API 默认不带鉴权，纯 localhost 用没问题，**但如果你把它暴露到 LAN 或 Tailnet（PENSIEVE_PEERS 要求暴露），裸奔很危险**。MCP 这边支持 Bearer token：
+Pensieve 的 `:8839` REST API 默认不带鉴权，纯 localhost 用没问题，**但暴露到 LAN 或 Tailnet（PENSIEVE_PEERS 必须暴露）裸奔很危险**。
+
+`./install.sh` 第 7 步会询问是否生成 token；跳过了或之后想开启：
 
 ```bash
-mkdir -p ~/.config/pensieve-mcp
-echo 'PENSIEVE_TOKEN=your-long-random-token' > ~/.config/pensieve-mcp/auth.env
+mkdir -p ~/.config/pensieve-mcp && chmod 700 ~/.config/pensieve-mcp
+printf "PENSIEVE_TOKEN=%s\n" "$(openssl rand -hex 32)" > ~/.config/pensieve-mcp/auth.env
 chmod 600 ~/.config/pensieve-mcp/auth.env
+memos stop && memos start    # server.py middleware 在启动时读 auth.env
 ```
 
-之后 MCP 调本地 Pensieve 和所有 peer 都会带 `Authorization: Bearer <token>`。**服务端**那一侧的鉴权校验得你自己配（反向代理或自定义中间件），本套件只管 client 端。
+工作原理（端到端）：
+- **服务端**：`patches/server.py.patch`（由 `./scripts/apply-patches.sh` apply，install.sh 自动调）注入了一个 FastAPI middleware——`auth.env` 存在时，任何**非 localhost** 请求若没带 `Authorization: Bearer <token>` 直接 401。`127.0.0.1` / `::1` 永远放行（Web UI 不受影响）
+- **客户端**：MCP 读同一个 `auth.env`，调本地 Pensieve 和所有 peer 都带 `Authorization: Bearer <token>`
+
+多设备时**每台机器写同一个 token**到各自的 `auth.env`。token 不一致会导致 peer 查询静默失败。
+
+### 升级
+
+上游 Pensieve 发新版时：
+
+```bash
+memos stop
+uv tool upgrade memos --with "transformers<5"
+./scripts/apply-patches.sh        # 重新打三个 site-packages patch
+memos start
+```
+
+`uv tool upgrade` / `uv tool install --force` 会清掉 site-packages，把鉴权 middleware、电源模式 override、镜像显示器过滤一并吹飞。`apply-patches.sh` 幂等，并且会探测上游飘移——升级后某个 patch apply 失败请开 issue。
+
+随时检查状态：`./scripts/apply-patches.sh --check`。
 
 ### 卸载
 

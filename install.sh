@@ -7,8 +7,9 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RETAIN_DAYS="${RETAIN_DAYS:-90}"
 PLIST_LABEL="com.user.pensieve.prune"
 PLIST_DST="${HOME}/Library/LaunchAgents/${PLIST_LABEL}.plist"
-COS_ENV_DIR="${HOME}/.config/pensieve-mcp"
-COS_ENV_FILE="${COS_ENV_DIR}/cos.env"
+PMCP_ENV_DIR="${HOME}/.config/pensieve-mcp"
+COS_ENV_FILE="${PMCP_ENV_DIR}/cos.env"
+AUTH_ENV_FILE="${PMCP_ENV_DIR}/auth.env"
 
 c_green()  { printf "\033[32m%s\033[0m\n" "$*"; }
 c_yellow() { printf "\033[33m%s\033[0m\n" "$*"; }
@@ -20,7 +21,7 @@ need() {
 }
 
 # ── 1. preflight ──────────────────────────────────────────────────────────────
-step "1/10  Preflight checks"
+step "1/12  Preflight checks"
 if [[ "$(uname -s)" != "Darwin" ]]; then
   c_red "This installer only supports macOS."; exit 1
 fi
@@ -33,13 +34,21 @@ command -v curl >/dev/null 2>&1 || { c_red "curl missing"; exit 1; }
 c_green "ok"
 
 # ── 2. install memos with transformers<5 pin (critical) ───────────────────────
-step "2/10  Install Pensieve (memos) via uv, pinned to transformers<5"
+step "2/12  Install Pensieve (memos) via uv, pinned to transformers<5"
 # transformers 5.x removed transformers.onnx, which pensieve still imports.
 uv tool install memos --with "transformers<5" --force
 c_green "ok"
 
-# ── 3. pre-download embedding model (with HF mirror fallback for China) ───────
-step "3/10  Pre-download embedding model (jina-embeddings-v2-base-en, ~280MB)"
+# ── 3. apply patches to memos site-packages ───────────────────────────────────
+step "3/12  Apply pensieve-mcp patches (auth middleware, power mode, mirror filter)"
+# These three patches live in patches/ and are wiped by `uv tool install
+# memos --force`. apply-patches.sh is idempotent; it also detects when the
+# upstream files have drifted.
+"${REPO_DIR}/scripts/apply-patches.sh"
+c_green "ok"
+
+# ── 4. pre-download embedding model (with HF mirror fallback for China) ───────
+step "4/12  Pre-download embedding model (jina-embeddings-v2-base-en, ~280MB)"
 # Without this, `memos serve` hangs on first startup while sentence-transformers
 # pulls the model from huggingface.co. From China the SSL handshake to HF often
 # fails (UNEXPECTED_EOF_WHILE_READING) and serve sits there indefinitely with
@@ -80,7 +89,7 @@ fi
 c_green "ok"
 
 # ── 4. init memos ─────────────────────────────────────────────────────────────
-step "4/10  Initialize memos config and database"
+step "5/12  Initialize memos config and database"
 if [[ -f "${HOME}/.memos/config.yaml" ]]; then
   c_yellow "~/.memos/config.yaml already exists — skipping init"
 else
@@ -88,8 +97,8 @@ else
 fi
 c_green "ok"
 
-# ── 5. screen recording permission ────────────────────────────────────────────
-step "5/10  Screen recording permission"
+# ── 6. screen recording permission ────────────────────────────────────────────
+step "6/12  Screen recording permission"
 cat <<EOF
 macOS needs Screen Recording permission for the terminal running \`memos record\`.
 Open System Settings → Privacy & Security → Screen Recording, and enable your terminal
@@ -101,8 +110,47 @@ open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapt
 read -r -p "Press Enter after granting permission (or Ctrl-C to abort)… " _
 c_green "ok"
 
-# ── 5. start memos ────────────────────────────────────────────────────────────
-step "6/10  Start memos services (serve + record + watch)"
+# ── 7. (optional) API auth onboarding ─────────────────────────────────────────
+step "7/12  Optional: API authentication (required if exposing :8839 to LAN/Tailnet)"
+if [[ -f "${AUTH_ENV_FILE}" ]]; then
+  c_green "found existing ${AUTH_ENV_FILE} — using it"
+else
+  cat <<EOF
+
+Pensieve's REST API on :8839 is unauthenticated by default. Localhost-only is
+fine. If you plan to:
+  - expose it to a Tailnet (PENSIEVE_PEERS multi-device aggregation), or
+  - bind 0.0.0.0 / let your LAN reach it
+…you should enable Bearer-token auth. The patch in step 3 already wired the
+middleware; it activates as soon as ${AUTH_ENV_FILE} exists.
+
+Localhost (127.0.0.1) is always allowed regardless — Web UI keeps working.
+EOF
+  read -r -p "Generate a token and enable auth now? [y/N] " ans
+  if [[ "${ans:-}" =~ ^[Yy]$ ]]; then
+    mkdir -p "${PMCP_ENV_DIR}"; chmod 700 "${PMCP_ENV_DIR}"
+    if command -v openssl >/dev/null 2>&1; then
+      tok="$(openssl rand -hex 32)"
+    else
+      tok="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+    fi
+    printf "PENSIEVE_TOKEN=%s\n" "${tok}" > "${AUTH_ENV_FILE}"
+    chmod 600 "${AUTH_ENV_FILE}"
+    c_green "wrote ${AUTH_ENV_FILE}  (chmod 600)"
+    echo
+    c_yellow "Token (also stored in ${AUTH_ENV_FILE}):"
+    printf "  \033[1m%s\033[0m\n" "${tok}"
+    echo
+    c_yellow "On any OTHER machine that uses PENSIEVE_PEERS to query this one,"
+    c_yellow "drop the same token into its ~/.config/pensieve-mcp/auth.env."
+  else
+    c_yellow "skipped — :8839 will remain unauthenticated"
+  fi
+fi
+c_green "ok"
+
+# ── 8. start memos ────────────────────────────────────────────────────────────
+step "8/12  Start memos services (serve + record + watch)"
 # Source HF_ENDPOINT if installer set one — protects re-runs / future restarts
 # in shells where the user hasn't exported it.
 [[ -f "${HF_ENV_FILE}" ]] && source "${HF_ENV_FILE}"
@@ -119,8 +167,8 @@ if [[ "${code:-}" != "200" ]]; then
 fi
 c_green "ok"
 
-# ── 6. (optional) configure COS cloud archive ─────────────────────────────────
-step "7/10  Optional: cloud archive of screenshots older than ${RETAIN_DAYS} days"
+# ── 9. (optional) configure COS cloud archive ─────────────────────────────────
+step "9/12  Optional: cloud archive of screenshots older than ${RETAIN_DAYS} days"
 ARCHIVE_ENABLED="no"
 if [[ -f "${COS_ENV_FILE}" ]]; then
   c_green "found existing ${COS_ENV_FILE} — using it"
@@ -138,7 +186,7 @@ See: ${REPO_DIR}/config/cos.env.example  and  ${REPO_DIR}/docs/cos-archive.md
 EOF
   read -r -p "Enable cloud archive now? [y/N] " ans
   if [[ "${ans:-}" =~ ^[Yy]$ ]]; then
-    mkdir -p "${COS_ENV_DIR}"; chmod 700 "${COS_ENV_DIR}"
+    mkdir -p "${PMCP_ENV_DIR}"; chmod 700 "${PMCP_ENV_DIR}" 2>/dev/null || true
     read -r -p "  COS_REGION [ap-shanghai]: " region; region="${region:-ap-shanghai}"
     read -r -p "  COS_BUCKET (e.g. pensieve-archive-1234567890): " bucket
     read -r -p "  COS_APPID (the trailing number in the bucket name): " appid
@@ -175,13 +223,13 @@ ENV
   fi
 fi
 
-# ── 7. install LaunchAgent ────────────────────────────────────────────────────
+# ── 10. install LaunchAgent ───────────────────────────────────────────────────
 if [[ "${ARCHIVE_ENABLED}" == "yes" ]]; then
   CRON_SCRIPT="${REPO_DIR}/scripts/archive-to-cos.sh"
-  step "8/10  LaunchAgent (daily 03:30, archive to COS, retain=${RETAIN_DAYS}d)"
+  step "10/12  LaunchAgent (daily 03:30, archive to COS, retain=${RETAIN_DAYS}d)"
 else
   CRON_SCRIPT="${REPO_DIR}/scripts/prune-screenshots.sh"
-  step "8/10  LaunchAgent (daily 03:30, local prune, retain=${RETAIN_DAYS}d)"
+  step "10/12  LaunchAgent (daily 03:30, local prune, retain=${RETAIN_DAYS}d)"
 fi
 mkdir -p "${HOME}/Library/LaunchAgents"
 sed \
@@ -195,14 +243,14 @@ launchctl unload "${PLIST_DST}" 2>/dev/null || true
 launchctl load "${PLIST_DST}"
 c_green "ok  → ${PLIST_DST}"
 
-# ── 8. register MCP server with Claude Code ───────────────────────────────────
-step "9/10  Register MCP server with Claude Code (user scope)"
+# ── 11. register MCP server with Claude Code ──────────────────────────────────
+step "11/12  Register MCP server with Claude Code (user scope)"
 claude mcp remove pensieve -s user >/dev/null 2>&1 || true
 claude mcp add pensieve -s user -- "${REPO_DIR}/scripts/pensieve-mcp.py"
 c_green "ok"
 
-# ── 9. done ───────────────────────────────────────────────────────────────────
-step "10/10  All set 🎉"
+# ── 12. done ──────────────────────────────────────────────────────────────────
+step "12/12  All set"
 cat <<EOF
 
 Next steps:
