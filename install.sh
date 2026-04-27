@@ -20,7 +20,7 @@ need() {
 }
 
 # ── 1. preflight ──────────────────────────────────────────────────────────────
-step "1/9  Preflight checks"
+step "1/10  Preflight checks"
 if [[ "$(uname -s)" != "Darwin" ]]; then
   c_red "This installer only supports macOS."; exit 1
 fi
@@ -33,13 +33,54 @@ command -v curl >/dev/null 2>&1 || { c_red "curl missing"; exit 1; }
 c_green "ok"
 
 # ── 2. install memos with transformers<5 pin (critical) ───────────────────────
-step "2/9  Install Pensieve (memos) via uv, pinned to transformers<5"
+step "2/10  Install Pensieve (memos) via uv, pinned to transformers<5"
 # transformers 5.x removed transformers.onnx, which pensieve still imports.
 uv tool install memos --with "transformers<5" --force
 c_green "ok"
 
-# ── 3. init memos ─────────────────────────────────────────────────────────────
-step "3/9  Initialize memos config and database"
+# ── 3. pre-download embedding model (with HF mirror fallback for China) ───────
+step "3/10  Pre-download embedding model (jina-embeddings-v2-base-en, ~280MB)"
+# Without this, `memos serve` hangs on first startup while sentence-transformers
+# pulls the model from huggingface.co. From China the SSL handshake to HF often
+# fails (UNEXPECTED_EOF_WHILE_READING) and serve sits there indefinitely with
+# the API frozen — see docs/troubleshooting.md ("serve hangs on startup").
+MEMOS_PY="${HOME}/.local/share/uv/tools/memos/bin/python"
+HF_ENV_FILE="${HOME}/.memos/hf.env"
+DOWNLOAD_PY='from huggingface_hub import snapshot_download
+snapshot_download("arkohut/jina-embeddings-v2-base-en")
+snapshot_download("jinaai/jina-bert-implementation", allow_patterns=["*.py","*.json"])
+print("done")'
+
+hf_endpoint=""
+if curl -sfI --max-time 6 https://huggingface.co/api/models/arkohut/jina-embeddings-v2-base-en >/dev/null 2>&1; then
+  c_green "huggingface.co reachable — using direct"
+else
+  c_yellow "huggingface.co unreachable — using https://hf-mirror.com (China-friendly mirror)"
+  hf_endpoint="https://hf-mirror.com"
+fi
+
+if ! HF_ENDPOINT="${hf_endpoint}" "${MEMOS_PY}" -c "${DOWNLOAD_PY}"; then
+  if [[ -z "${hf_endpoint}" ]]; then
+    c_yellow "Direct download failed — retrying via https://hf-mirror.com"
+    hf_endpoint="https://hf-mirror.com"
+    HF_ENDPOINT="${hf_endpoint}" "${MEMOS_PY}" -c "${DOWNLOAD_PY}" \
+      || { c_red "Embedding model download failed via mirror too. Check network."; exit 1; }
+  else
+    c_red "Embedding model download failed."; exit 1
+  fi
+fi
+
+# Persist HF_ENDPOINT so future `memos start` (e.g. after model cache wipe or
+# new model) doesn't re-hit the SSL hang. Sourced by `memos start` wrapper if
+# present; harmless otherwise.
+if [[ -n "${hf_endpoint}" ]]; then
+  echo "export HF_ENDPOINT=${hf_endpoint}" > "${HF_ENV_FILE}"
+  c_green "wrote ${HF_ENV_FILE}  (HF_ENDPOINT=${hf_endpoint})"
+fi
+c_green "ok"
+
+# ── 4. init memos ─────────────────────────────────────────────────────────────
+step "4/10  Initialize memos config and database"
 if [[ -f "${HOME}/.memos/config.yaml" ]]; then
   c_yellow "~/.memos/config.yaml already exists — skipping init"
 else
@@ -47,8 +88,8 @@ else
 fi
 c_green "ok"
 
-# ── 4. screen recording permission ────────────────────────────────────────────
-step "4/9  Screen recording permission"
+# ── 5. screen recording permission ────────────────────────────────────────────
+step "5/10  Screen recording permission"
 cat <<EOF
 macOS needs Screen Recording permission for the terminal running \`memos record\`.
 Open System Settings → Privacy & Security → Screen Recording, and enable your terminal
@@ -61,7 +102,10 @@ read -r -p "Press Enter after granting permission (or Ctrl-C to abort)… " _
 c_green "ok"
 
 # ── 5. start memos ────────────────────────────────────────────────────────────
-step "5/9  Start memos services (serve + record + watch)"
+step "6/10  Start memos services (serve + record + watch)"
+# Source HF_ENDPOINT if installer set one — protects re-runs / future restarts
+# in shells where the user hasn't exported it.
+[[ -f "${HF_ENV_FILE}" ]] && source "${HF_ENV_FILE}"
 memos start || true
 printf "Waiting for REST API"
 for _ in $(seq 1 15); do
@@ -76,7 +120,7 @@ fi
 c_green "ok"
 
 # ── 6. (optional) configure COS cloud archive ─────────────────────────────────
-step "6/9  Optional: cloud archive of screenshots older than ${RETAIN_DAYS} days"
+step "7/10  Optional: cloud archive of screenshots older than ${RETAIN_DAYS} days"
 ARCHIVE_ENABLED="no"
 if [[ -f "${COS_ENV_FILE}" ]]; then
   c_green "found existing ${COS_ENV_FILE} — using it"
@@ -134,10 +178,10 @@ fi
 # ── 7. install LaunchAgent ────────────────────────────────────────────────────
 if [[ "${ARCHIVE_ENABLED}" == "yes" ]]; then
   CRON_SCRIPT="${REPO_DIR}/scripts/archive-to-cos.sh"
-  step "7/9  LaunchAgent (daily 03:30, archive to COS, retain=${RETAIN_DAYS}d)"
+  step "8/10  LaunchAgent (daily 03:30, archive to COS, retain=${RETAIN_DAYS}d)"
 else
   CRON_SCRIPT="${REPO_DIR}/scripts/prune-screenshots.sh"
-  step "7/9  LaunchAgent (daily 03:30, local prune, retain=${RETAIN_DAYS}d)"
+  step "8/10  LaunchAgent (daily 03:30, local prune, retain=${RETAIN_DAYS}d)"
 fi
 mkdir -p "${HOME}/Library/LaunchAgents"
 sed \
@@ -152,13 +196,13 @@ launchctl load "${PLIST_DST}"
 c_green "ok  → ${PLIST_DST}"
 
 # ── 8. register MCP server with Claude Code ───────────────────────────────────
-step "8/9  Register MCP server with Claude Code (user scope)"
+step "9/10  Register MCP server with Claude Code (user scope)"
 claude mcp remove pensieve -s user >/dev/null 2>&1 || true
 claude mcp add pensieve -s user -- "${REPO_DIR}/scripts/pensieve-mcp.py"
 c_green "ok"
 
 # ── 9. done ───────────────────────────────────────────────────────────────────
-step "9/9  All set 🎉"
+step "10/10  All set 🎉"
 cat <<EOF
 
 Next steps:

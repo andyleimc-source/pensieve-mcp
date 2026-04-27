@@ -1,5 +1,31 @@
 # Troubleshooting
 
+## `memos serve` hangs on first startup; MCP / API calls all time out
+
+**Symptoms**: `memos ps` shows serve "Running", but `curl http://localhost:8839/api/...` hangs forever. `~/.memos/logs/serve.log` is stuck at `Loading SentenceTransformer model from arkohut/jina-embeddings-v2-base-en` and may show repeated SSL retries:
+
+```
+SSLError(SSLEOFError(8, '[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred …'))
+… requesting HEAD https://huggingface.co/arkohut/jina-embeddings-v2-base-en/resolve/main/modules.json
+```
+
+**Cause**: On first startup, `sentence-transformers` downloads ~280 MB of embedding model weights from `huggingface.co`. From mainland China the SSL handshake to HF often fails (GFW interference), serve's main thread gets stuck in retry loops, and every API request blocks.
+
+**Fix**: use the China-friendly mirror `hf-mirror.com`.
+
+```bash
+memos stop serve
+HF_ENDPOINT=https://hf-mirror.com memos serve
+```
+
+This repo's `install.sh` auto-detects HF reachability and pre-downloads the model via the mirror when needed, then writes `~/.memos/hf.env` so subsequent `memos start` invocations stay healthy. If you installed before this fix and hit the hang, just re-run `./install.sh` — it's idempotent.
+
+To make the mirror permanent across reboots, add to your shell rc:
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
 ## `/api/search` returns 500: `No module named 'transformers.onnx'`
 
 **Cause**: upstream Pensieve doesn't pin `transformers`. `uv` resolves to `transformers>=5`, which removed the `transformers.onnx` submodule that Pensieve's embedding code still imports. Web UI keyword search may look fine (falls back to FTS), but MCP / semantic API is dead.
