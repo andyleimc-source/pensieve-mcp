@@ -76,6 +76,8 @@ The MCP server (`scripts/pensieve-mcp.py`) exposes these tools to Claude Code:
 | `pause_recording(duration_seconds?, resume_at?)` | Stop screen recording. Optional auto-resume after duration or at ISO timestamp. Survives sleep/reboot. |
 | `resume_recording()` | Resume immediately, cancel any scheduled auto-resume. |
 | `recording_status()` | Whether record is running, plus any active pause schedule. |
+| `activity_summary(start?, end?, top_apps?)` | Aggregate what you worked on in a time range — top apps, sample windows, hit count — without dumping every OCR snippet into Claude's context. |
+| `get_power_mode()` / `set_power_mode(mode)` / `toggle_full_power()` | Switch capture cadence between `eco` (slow, low CPU) and `performance` (fast, more detail). Useful when you're about to do something you really want recorded. |
 | `health()` | Ping the Pensieve REST API; reports archive configuration too. |
 
 ### Optional: cloud archive (Tencent COS)
@@ -83,6 +85,33 @@ The MCP server (`scripts/pensieve-mcp.py`) exposes these tools to Claude Code:
 By default, screenshots older than 90 days are deleted locally. Enable cloud archive during `./install.sh` (step 6) to upload them to a Tencent Cloud COS bucket instead — they stay searchable through the MCP, only the image bytes move to the cloud. ~¥1–3/month per 100GB.
 
 See [docs/cos-archive.md](docs/cos-archive.md) for the full setup (bucket, CAM sub-account, policy) and how it interacts with the MCP.
+
+### Optional: multi-device aggregation
+
+If you run Pensieve on multiple Macs (e.g. home + work) and connect them via [Tailscale](https://tailscale.com), one MCP can transparently search across all of them. Set `PENSIEVE_PEERS` to a comma-separated list of peer base URLs (Tailscale IPs):
+
+```bash
+export PENSIEVE_PEERS="http://100.x.y.z:8839,http://100.a.b.c:8839"
+```
+
+Search results from peers are tagged with `source=<hostname>`; local hits stay tagged `source=local`. Failures on individual peers are swallowed (you still get local results).
+
+Notes:
+- Peers must use the **same** `PENSIEVE_TOKEN` (see below) for auth to work, or all be unauthenticated.
+- Peer queries skip httpx's auto-proxy detection (`trust_env=False`), since macOS system proxies (Clash/V2Ray) tend to break Tailscale CGNAT routing.
+- Configure on **each** Mac symmetrically and you get bidirectional aggregation — querying either machine searches both.
+
+### Optional: API authentication
+
+By default, Pensieve's REST API on `:8839` is unauthenticated. That's fine for pure localhost use, but **dangerous if you expose it to a LAN or Tailnet** (which `PENSIEVE_PEERS` requires). To enable Bearer-token auth on the MCP side, drop the token into:
+
+```bash
+mkdir -p ~/.config/pensieve-mcp
+echo 'PENSIEVE_TOKEN=your-long-random-token' > ~/.config/pensieve-mcp/auth.env
+chmod 600 ~/.config/pensieve-mcp/auth.env
+```
+
+The MCP will send `Authorization: Bearer <token>` on every request to local Pensieve and to any peers. You're responsible for configuring the matching auth check on the Pensieve server side (e.g. via a reverse proxy or a custom middleware) — this kit only handles the **client** side.
 
 ### Uninstall
 
@@ -171,6 +200,8 @@ open http://localhost:8839      # Pensieve Web UI
 | `pause_recording(duration_seconds?, resume_at?)` | 暂停截屏。可选自动恢复（按时长或绝对时间），睡眠/重启都能正常恢复 |
 | `resume_recording()` | 立刻恢复截屏，取消计划中的自动恢复 |
 | `recording_status()` | 报告 record 进程是否运行 + 当前暂停状态 |
+| `activity_summary(start?, end?, top_apps?)` | 聚合时间段内的活动概况——top apps、窗口样本、命中数——避免把每张截图的 OCR 全塞进 Claude 上下文 |
+| `get_power_mode()` / `set_power_mode(mode)` / `toggle_full_power()` | 切换截屏节奏：`eco`（慢、省电）/ `performance`（快、记得多）。要专心做某件事且希望它被完整记录时拉满 |
 | `health()` | 探活；同时报告归档功能是否启用 |
 
 直接对 Claude 说："暂停截屏 2 小时"、"暂停到明早 9 点"、"暂停一下"（无限期）都能识别。
@@ -180,6 +211,33 @@ open http://localhost:8839      # Pensieve Web UI
 默认行为是 90 天外的截图本地直接删。在 `./install.sh` 第 6 步可以选启用云归档——超期截图先传到你私人的 COS 桶再删本地，**搜索照常工作**（OCR 文本和向量在本地 SQLite，没动），只是图片本体上云。100GB 一年 ~¥10-30。
 
 详见 [docs/cos-archive.md](docs/cos-archive.md)：建桶、CAM 子账号、最小权限策略、和 MCP 怎么联动。
+
+### 可选：多设备聚合
+
+如果你在多台 Mac 上都跑了 Pensieve（比如家里 + 公司），又用 [Tailscale](https://tailscale.com) 把它们连起来，一个 MCP 就能透明地跨设备搜。`PENSIEVE_PEERS` 设成逗号分隔的 peer URL 列表（Tailscale IP）：
+
+```bash
+export PENSIEVE_PEERS="http://100.x.y.z:8839,http://100.a.b.c:8839"
+```
+
+peer 来的结果会带 `source=<hostname>` 标签；本地命中标 `source=local`。某个 peer 抽风也不影响——本地结果照样返回。
+
+说明：
+- peer 必须**统一**用同一个 `PENSIEVE_TOKEN`（见下文），或者全部都不带 auth
+- peer 查询会跳过 httpx 的自动代理探测（`trust_env=False`），因为 macOS 系统代理（Clash/V2Ray）一般不会路由 Tailscale CGNAT 段，会反 502
+- 两台机器**对称**配置就能双向聚合——查任一台都搜两台
+
+### 可选：API 鉴权
+
+Pensieve 的 `:8839` REST API 默认不带鉴权，纯 localhost 用没问题，**但如果你把它暴露到 LAN 或 Tailnet（PENSIEVE_PEERS 要求暴露），裸奔很危险**。MCP 这边支持 Bearer token：
+
+```bash
+mkdir -p ~/.config/pensieve-mcp
+echo 'PENSIEVE_TOKEN=your-long-random-token' > ~/.config/pensieve-mcp/auth.env
+chmod 600 ~/.config/pensieve-mcp/auth.env
+```
+
+之后 MCP 调本地 Pensieve 和所有 peer 都会带 `Authorization: Bearer <token>`。**服务端**那一侧的鉴权校验得你自己配（反向代理或自定义中间件），本套件只管 client 端。
 
 ### 卸载
 

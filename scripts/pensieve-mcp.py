@@ -11,6 +11,9 @@
 
 When COS archive credentials are present at ~/.config/pensieve-mcp/cos.env,
 also exposes archive lookups for screenshots that have been pruned locally.
+
+Multi-device: set PENSIEVE_PEERS=http://100.x.y.z:8839,... to aggregate
+results from remote machines. Each hit is tagged with source=<hostname>.
 """
 from __future__ import annotations
 
@@ -18,6 +21,7 @@ import json
 import os
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -28,9 +32,35 @@ from mcp.server.fastmcp import FastMCP
 
 BASE = os.environ.get("PENSIEVE_BASE_URL", "http://localhost:8839")
 LIBRARY_ID = int(os.environ.get("PENSIEVE_LIBRARY_ID", "1"))
+
+# Comma-separated peer base URLs, e.g. "http://100.x.y.z:8839"
+_raw_peers = os.environ.get("PENSIEVE_PEERS", "").strip()
+PEERS: list[str] = [p.strip().rstrip("/") for p in _raw_peers.split(",") if p.strip()]
 TIMEOUT = 30.0
 SHOT_DIR = Path.home() / ".memos" / "screenshots"
 COS_ENV_PATH = Path.home() / ".config" / "pensieve-mcp" / "cos.env"
+AUTH_ENV_PATH = Path.home() / ".config" / "pensieve-mcp" / "auth.env"
+
+
+def _load_api_token() -> str | None:
+    """Read PENSIEVE_TOKEN from ~/.config/pensieve-mcp/auth.env, if present."""
+    if not AUTH_ENV_PATH.is_file():
+        return None
+    try:
+        for line in AUTH_ENV_PATH.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("PENSIEVE_TOKEN="):
+                tok = line.split("=", 1)[1].strip().strip('"').strip("'")
+                return tok or None
+    except Exception:
+        pass
+    return None
+
+
+_API_TOKEN = _load_api_token()
+AUTH_HEADERS: dict[str, str] = (
+    {"Authorization": f"Bearer {_API_TOKEN}"} if _API_TOKEN else {}
+)
 COSCMD = str(Path.home() / ".local" / "bin" / "coscmd")
 MEMOS_BIN = str(Path.home() / ".local" / "bin" / "memos")
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -182,6 +212,87 @@ def _maybe_warning(payload: dict[str, Any], threshold: int = 5000) -> dict[str, 
     return payload
 
 
+# ── peer helpers ──────────────────────────────────────────────────────────────
+
+
+def _peer_hostname(base_url: str) -> str:
+    """Extract a short label from a peer URL for tagging results."""
+    host = base_url.split("//")[-1].split(":")[0]
+    return host
+
+
+def _peer_get(peer: str, params: dict[str, Any], retries: int = 2) -> dict | None:
+    """GET /api/search on a peer with simple retry on 5xx (Tailscale relay flakes).
+
+    `trust_env=False` skips httpx's auto-proxy detection — macOS system proxies
+    (Clash/V2Ray) don't know how to route Tailscale CGNAT (100.64.0.0/10) and
+    return 502.
+    """
+    for attempt in range(retries + 1):
+        try:
+            r = httpx.get(f"{peer}/api/search", params=params,
+                          timeout=TIMEOUT, trust_env=False,
+                          headers=AUTH_HEADERS)
+            if r.status_code >= 500 and attempt < retries:
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            if attempt < retries:
+                continue
+            return None
+    return None
+
+
+def _peer_search(peer: str, params: dict[str, Any], include_ocr: bool) -> list[dict]:
+    """Query one peer's /api/search; returns summarized hits tagged with source."""
+    data = _peer_get(peer, params)
+    if data is None:
+        return []
+    label = _peer_hostname(peer)
+    hits = []
+    for h in data.get("hits", []):
+        doc = h.get("document", {})
+        summary = _summarize_hit(doc, include_ocr=include_ocr)
+        summary["source"] = label
+        hits.append(summary)
+    return hits
+
+
+def _peer_scan(peer: str, s_ts: int, e_ts: int) -> list[dict]:
+    """Scan all entities from a peer in a time range (mirrors _scan_entities)."""
+    docs: list[dict] = []
+    seen: set[int] = set()
+    stack: list[tuple[int, int]] = [(s_ts, e_ts)]
+    label = _peer_hostname(peer)
+    for _ in range(2000):
+        if not stack:
+            break
+        a, b = stack.pop()
+        if b <= a:
+            continue
+        data = _peer_get(peer, {"q": "", "limit": _SCAN_PAGE_LIMIT, "library_ids": 1,
+                                 "start": a, "end": b})
+        if data is None:
+            continue
+        hits = data.get("hits", []) or []
+        if len(hits) >= _SCAN_PAGE_LIMIT and (b - a) > 1:
+            mid = (a + b) // 2
+            if mid > a and mid < b:
+                stack.append((a, mid))
+                stack.append((mid + 1, b))
+                continue
+        for h in hits:
+            doc = h.get("document") or {}
+            did = doc.get("id")
+            if did is None or did in seen:
+                continue
+            seen.add(did)
+            doc["_source"] = label
+            docs.append(doc)
+    return docs
+
+
 # ── tools ─────────────────────────────────────────────────────────────────────
 
 
@@ -273,17 +384,29 @@ def search_screenshots(
         params["start"] = s_ts
     if e_ts is not None:
         params["end"] = e_ts
-    r = httpx.get(f"{BASE}/api/search", params=params, timeout=TIMEOUT)
+    r = httpx.get(f"{BASE}/api/search", params=params, timeout=TIMEOUT,
+                  headers=AUTH_HEADERS)
     r.raise_for_status()
     data = r.json()
+    local_hits = [
+        {**_summarize_hit(h.get("document", {}), include_ocr=include_ocr), "source": "local"}
+        for h in data.get("hits", [])
+    ]
+
+    peer_hits: list[dict] = []
+    if PEERS:
+        with ThreadPoolExecutor(max_workers=len(PEERS)) as ex:
+            futures = {ex.submit(_peer_search, p, params, include_ocr): p for p in PEERS}
+            for fut in as_completed(futures):
+                peer_hits.extend(fut.result())
+
+    all_hits = local_hits + peer_hits
     out: dict[str, Any] = {
-        "found": data.get("found", 0),
-        "returned": len(data.get("hits", [])),
+        "found": data.get("found", 0) + len(peer_hits),
+        "returned": len(all_hits),
         "include_ocr": include_ocr,
-        "hits": [
-            _summarize_hit(h.get("document", {}), include_ocr=include_ocr)
-            for h in data.get("hits", [])
-        ],
+        "sources": ["local"] + [_peer_hostname(p) for p in PEERS],
+        "hits": all_hits,
     }
     if s_ts is not None or e_ts is not None:
         out["time_range"] = {"start": s_ts, "end": e_ts}
@@ -305,7 +428,8 @@ def get_screenshot(entity_id: int, max_chars: int = 2000) -> dict[str, Any]:
     `archive_status` will be "archived" and `cos_key` indicates where
     it lives.
     """
-    r = httpx.get(f"{BASE}/api/entities/{int(entity_id)}", timeout=TIMEOUT)
+    r = httpx.get(f"{BASE}/api/entities/{int(entity_id)}", timeout=TIMEOUT,
+                  headers=AUTH_HEADERS)
     r.raise_for_status()
     doc = r.json()
     meta = doc.get("metadata_entries") or []
@@ -347,7 +471,8 @@ def download_archived(entity_id: int) -> dict[str, Any]:
     """
     if not COS:
         return {"error": "COS archive not configured (no ~/.config/pensieve-mcp/cos.env)"}
-    r = httpx.get(f"{BASE}/api/entities/{int(entity_id)}", timeout=TIMEOUT)
+    r = httpx.get(f"{BASE}/api/entities/{int(entity_id)}", timeout=TIMEOUT,
+                  headers=AUTH_HEADERS)
     r.raise_for_status()
     fp = r.json().get("filepath")
     key = _cos_key_for(fp)
@@ -395,6 +520,7 @@ def _scan_entities(s_ts: int, e_ts: int) -> list[dict]:
             params={"q": "", "limit": _SCAN_PAGE_LIMIT, "library_ids": LIBRARY_ID,
                     "start": a, "end": b},
             timeout=TIMEOUT,
+            headers=AUTH_HEADERS,
         )
         r.raise_for_status()
         hits = r.json().get("hits", []) or []
@@ -451,6 +577,15 @@ def activity_summary(
         return {"error": "end must be after start", "start": s_ts, "end": e_ts}
 
     docs = _scan_entities(s_ts, e_ts)
+    for doc in docs:
+        doc.setdefault("_source", "local")
+
+    if PEERS:
+        with ThreadPoolExecutor(max_workers=len(PEERS)) as ex:
+            futures = {ex.submit(_peer_scan, p, s_ts, e_ts): p for p in PEERS}
+            for fut in as_completed(futures):
+                docs.extend(fut.result())
+
     total = len(docs)
 
     app_counts: Counter[str] = Counter()
@@ -528,7 +663,7 @@ def _install_resume_agent() -> None:
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key><string>{Path.home()}</string>
-        <key>PATH</key><string>{Path.home()}/.local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <key>PATH</key><string>{Path.home()}/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
     <key>StandardOutPath</key><string>{Path.home()}/.memos/resume.stdout.log</string>
     <key>StandardErrorPath</key><string>{Path.home()}/.memos/resume.stderr.log</string>
@@ -652,7 +787,7 @@ def recording_status() -> dict[str, Any]:
 @mcp.tool()
 def health() -> dict[str, Any]:
     """Check that the Pensieve REST API is up; report archive availability too."""
-    r = httpx.get(f"{BASE}/api/health", timeout=5.0)
+    r = httpx.get(f"{BASE}/api/health", timeout=5.0, headers=AUTH_HEADERS)
     return {
         "status_code": r.status_code,
         "body": r.json(),
