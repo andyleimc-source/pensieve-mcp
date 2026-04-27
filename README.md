@@ -16,6 +16,7 @@ Turn your Mac's screen into a searchable, local-first memory — and let Claude 
 - **Claude Code MCP integration** — ask *"what did I work on this afternoon?"* in Claude Code and it queries your local screen history directly. No external LLM key needed beyond Claude Code.
 - **Activity summary tool** — aggregate a time range into top apps + sample windows + hit count, so Claude can answer "what did I do today?" without bloating its context with raw OCR.
 - **Pause / resume capture** — tell Claude *"pause for 2 hours"* or *"pause until 9am tomorrow"*; survives sleep and reboot via launchd.
+- **Privacy controls** — retroactively purge screenshots from any time range (with a dry-run preview), or add apps to a recording blacklist so they're never captured in the first place.
 - **Power modes** — switch capture cadence between `eco` (slow, low CPU) and `performance` (fast, more detail) on the fly.
 - **Daily retention policy** — launchd job prunes screenshots older than `RETAIN_DAYS` (default 90). Pensieve has none built in.
 - **Optional cloud archive (Tencent COS)** — instead of deleting old screenshots, upload image bytes to your private COS bucket. OCR/embeddings stay local, so search still works; ~¥1–3/month per 100GB.
@@ -90,6 +91,8 @@ The MCP server (`scripts/pensieve-mcp.py`) exposes these tools to Claude Code:
 | `recording_status()` | Whether record is running, plus any active pause schedule. |
 | `activity_summary(start?, end?, top_apps?)` | Aggregate what you worked on in a time range — top apps, sample windows, hit count — without dumping every OCR snippet into Claude's context. |
 | `get_power_mode()` / `set_power_mode(mode)` / `toggle_full_power()` | Switch capture cadence between `eco` (slow, low CPU) and `performance` (fast, more detail). Useful when you're about to do something you really want recorded. |
+| `purge_screenshots(start, end?, app?, confirm=False)` | Retroactively delete screenshots in a time range (and their DB rows) — for redacting sensitive activity captured by accident. Dry-run by default; pass `confirm=True` to actually delete. Local machine only; not cascaded to peers. |
+| `list_app_blacklist()` / `add_app_blacklist(app)` / `remove_app_blacklist(app)` | Manage the recording blacklist (`app_blacklist` in `~/.memos/config.yaml`). Apps in the list are skipped at capture time. Use for password managers, banking apps, anything you never want screenshotted. Auto-restarts `record` so changes are live. |
 | `health()` | Ping the Pensieve REST API; reports archive configuration too. |
 
 ### Optional: cloud archive (Tencent COS)
@@ -176,6 +179,7 @@ License: MIT.
 - **Claude Code MCP 集成**：在 Claude Code 里直接问"我下午都在干嘛"，它会查你本地的屏幕历史回答。**不需要额外 API key**，用你订阅里的 Claude 即可
 - **活动汇总工具**：`activity_summary` 把时间段聚合成 top apps + 窗口样本 + 命中数，让 Claude 答"今天我都干了啥"时不会被海量 OCR 撑爆上下文
 - **暂停 / 恢复截屏**：直接对 Claude 说"暂停 2 小时""暂停到明早 9 点""暂停一下"都行；通过 launchd 实现，睡眠 / 重启都能正常恢复
+- **隐私控制**：事后撤回任意时间段的截图（带 dry-run 预览），或把敏感 app 加进录制黑名单从源头就不录
 - **电源模式切换**：`eco`（慢、省电）和 `performance`（快、记得多）随时切，要专心做某件事且希望被完整记录就拉满
 - **每日保留策略**：launchd 每天凌晨清理 `RETAIN_DAYS`（默认 90）天外的截图。Pensieve 官方没有这功能
 - **可选云归档（腾讯云 COS）**：超期截图不直接删，传到你私人 COS 桶，OCR 文本和向量留在本地——**搜索照常工作**，只是图片本体上云。100GB 一年 ~¥10-30
@@ -248,6 +252,8 @@ open http://localhost:8839      # Pensieve Web UI
 | `recording_status()` | 报告 record 进程是否运行 + 当前暂停状态 |
 | `activity_summary(start?, end?, top_apps?)` | 聚合时间段内的活动概况——top apps、窗口样本、命中数——避免把每张截图的 OCR 全塞进 Claude 上下文 |
 | `get_power_mode()` / `set_power_mode(mode)` / `toggle_full_power()` | 切换截屏节奏：`eco`（慢、省电）/ `performance`（快、记得多）。要专心做某件事且希望它被完整记录时拉满 |
+| `purge_screenshots(start, end?, app?, confirm=False)` | 事后删除某段时间的截图（连 DB 行一起删），用于撤回意外被录到的敏感操作（网银、密码管理器等）。默认 dry_run，要 `confirm=True` 才真删；只作用于本机，不级联到 peer |
+| `list_app_blacklist()` / `add_app_blacklist(app)` / `remove_app_blacklist(app)` | 管理录制黑名单（`~/.memos/config.yaml` 里的 `app_blacklist`）。黑名单里的 app 在前台时整个 tick 跳过截屏。适合密码管理器、网银、医疗等永不录制的场景。改完自动 `memos restart record` |
 | `health()` | 探活；同时报告归档功能是否启用 |
 
 直接对 Claude 说："暂停截屏 2 小时"、"暂停到明早 9 点"、"暂停一下"（无限期）都能识别。

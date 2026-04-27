@@ -5,6 +5,7 @@
 #   "mcp>=1.2.0",
 #   "httpx>=0.27",
 #   "psutil>=5.9",
+#   "ruamel.yaml>=0.18",
 # ]
 # ///
 """Pensieve MCP server. Wraps the local memos REST API at :8839.
@@ -38,6 +39,7 @@ _raw_peers = os.environ.get("PENSIEVE_PEERS", "").strip()
 PEERS: list[str] = [p.strip().rstrip("/") for p in _raw_peers.split(",") if p.strip()]
 TIMEOUT = 30.0
 SHOT_DIR = Path.home() / ".memos" / "screenshots"
+CONFIG_PATH = Path.home() / ".memos" / "config.yaml"
 COS_ENV_PATH = Path.home() / ".config" / "pensieve-mcp" / "cos.env"
 AUTH_ENV_PATH = Path.home() / ".config" / "pensieve-mcp" / "auth.env"
 
@@ -928,6 +930,225 @@ def toggle_full_power() -> dict[str, Any]:
     """
     new_mode = "auto" if _read_power_mode() == "full_power" else "full_power"
     return set_power_mode(new_mode)
+
+
+# ── retroactive purge ────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+def purge_screenshots(
+    start: str | int | None = None,
+    end: str | int | None = None,
+    app: str | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Permanently delete screenshots in a time range (and their DB rows).
+
+    For redacting sensitive activity captured by Pensieve — banking pages,
+    password managers, medical sites, anything you want gone. Operates only
+    on the LOCAL machine; does NOT cascade to PEERS (run there separately).
+
+    Args:
+        start: Range start. Same syntax as search_screenshots.start.
+               Symbolic ranges ("yesterday afternoon", "last 24h", "today")
+               fill in the end automatically. Required.
+        end: Range end (ISO 8601 / unix int). Ignored if `start` is symbolic.
+        app: Only delete screenshots whose active_app matches this string
+             (substring match, case-insensitive). e.g. "1Password", "Safari".
+        confirm: Must be True to actually delete. When False (default), this
+                 is a dry-run that returns the count + a sample of what
+                 would be deleted.
+
+    Returns: count, sample (first 5 entries), and either
+             `dry_run: True` with a hint, or `deleted` / `errors` arrays.
+    """
+    if start is None:
+        return {"error": "start is required (e.g. 'yesterday afternoon', "
+                         "'last 24h', or an ISO timestamp)"}
+    s_ts, e_ts = _parse_range(start, end)
+    if s_ts is None or e_ts is None:
+        return {"error": "could not resolve time range", "start": start, "end": end}
+    if e_ts <= s_ts:
+        return {"error": "end must be after start", "start": s_ts, "end": e_ts}
+
+    docs = _scan_entities(s_ts, e_ts)
+    if app:
+        needle = app.lower()
+        docs = [d for d in docs
+                if needle in (_meta_get(d.get("metadata_entries") or [], "active_app") or "").lower()]
+
+    sample = [
+        {
+            "id": d.get("id"),
+            "created_at": d.get("file_created_at"),
+            "app": _meta_get(d.get("metadata_entries") or [], "active_app"),
+            "window": _meta_get(d.get("metadata_entries") or [], "active_window"),
+        }
+        for d in docs[:5]
+    ]
+    summary: dict[str, Any] = {
+        "count": len(docs),
+        "time_range": {"start": s_ts, "end": e_ts},
+        "app_filter": app,
+        "sample": sample,
+    }
+    if not confirm:
+        summary["dry_run"] = True
+        summary["hint"] = (
+            f"would delete {len(docs)} screenshot(s). "
+            "Re-call with confirm=True to actually delete. "
+            "Deletion removes BOTH the .webp file and the DB row; not reversible."
+        )
+        return summary
+
+    deleted = 0
+    errors: list[dict[str, Any]] = []
+    for d in docs:
+        eid = d.get("id")
+        fp = d.get("filepath")
+        if eid is None:
+            errors.append({"reason": "no entity id", "doc": d})
+            continue
+        try:
+            r = httpx.delete(
+                f"{BASE}/api/libraries/{LIBRARY_ID}/entities/{int(eid)}",
+                timeout=TIMEOUT,
+                headers=AUTH_HEADERS,
+            )
+            if r.status_code not in (200, 204, 404):
+                errors.append({"id": eid, "status": r.status_code,
+                               "body": r.text[:200]})
+                continue
+        except Exception as exc:
+            errors.append({"id": eid, "error": str(exc)})
+            continue
+        if fp:
+            try:
+                Path(fp).unlink(missing_ok=True)
+            except Exception as exc:
+                errors.append({"id": eid, "filepath": fp, "unlink_error": str(exc)})
+        deleted += 1
+
+    summary["dry_run"] = False
+    summary["deleted"] = deleted
+    summary["errors"] = errors
+    return summary
+
+
+# ── app blacklist (skip recording while these apps are foreground) ───────────
+
+
+def _load_config_yaml():
+    """Lazy-load ruamel.yaml; returns (yaml_obj, config_data).
+
+    Real Pensieve configs in the wild have duplicate keys (e.g. two `prompt:`
+    entries under vlm: when the user edited the default twice without removing
+    the original). ruamel.yaml errors on duplicates by default; allow them so
+    we don't fail to load an otherwise-functional config.
+    """
+    from ruamel.yaml import YAML
+    yaml = YAML()
+    yaml.preserve_quotes = True
+    yaml.width = 120
+    yaml.allow_duplicate_keys = True
+    if not CONFIG_PATH.is_file():
+        return yaml, None
+    with CONFIG_PATH.open("r") as f:
+        return yaml, yaml.load(f)
+
+
+def _save_config_yaml(yaml, data) -> None:
+    with CONFIG_PATH.open("w") as f:
+        yaml.dump(data, f)
+
+
+def _restart_record() -> str:
+    """Restart the record process so config changes take effect. Returns combined output."""
+    proc = subprocess.run(
+        [MEMOS_BIN, "restart", "record"],
+        capture_output=True, text=True, timeout=20,
+    )
+    return (proc.stdout + proc.stderr).strip()
+
+
+@mcp.tool()
+def list_app_blacklist() -> dict[str, Any]:
+    """Show apps currently excluded from recording.
+
+    When an app in this list is the foreground app, Pensieve skips the
+    screenshot for that tick. Matching is case-insensitive substring.
+    """
+    _, data = _load_config_yaml()
+    if data is None:
+        return {"error": f"{CONFIG_PATH} not found", "blacklist": []}
+    bl = data.get("app_blacklist") or []
+    return {"blacklist": list(bl), "count": len(bl), "config_path": str(CONFIG_PATH)}
+
+
+@mcp.tool()
+def add_app_blacklist(app: str, restart: bool = True) -> dict[str, Any]:
+    """Add an app to the recording blacklist (won't be screenshotted while focused).
+
+    Use for sensitive apps you never want captured — password managers,
+    banking apps, medical/legal portals, internal admin consoles, etc.
+    Pensieve does case-insensitive substring matching, so "1Password"
+    matches "1Password 7", "1Password CLI", etc.
+
+    Args:
+        app: App name or substring. Case-insensitive.
+        restart: If True (default), runs `memos restart record` so the
+                 change takes effect immediately. Set False if you're
+                 batching multiple add/remove calls.
+    """
+    app = (app or "").strip()
+    if not app:
+        return {"error": "app must be non-empty"}
+    yaml, data = _load_config_yaml()
+    if data is None:
+        return {"error": f"{CONFIG_PATH} not found — is memos initialized?"}
+    bl = data.get("app_blacklist") or []
+    existing_lower = [str(x).lower() for x in bl]
+    if app.lower() in existing_lower:
+        return {"ok": True, "noop": True, "blacklist": list(bl),
+                "note": f"{app!r} already present"}
+    bl.append(app)
+    data["app_blacklist"] = bl
+    _save_config_yaml(yaml, data)
+    out: dict[str, Any] = {"ok": True, "added": app, "blacklist": list(bl)}
+    if restart:
+        out["restart_output"] = _restart_record()
+    else:
+        out["note"] = "config written; call memos restart record (or pass restart=True)"
+    return out
+
+
+@mcp.tool()
+def remove_app_blacklist(app: str, restart: bool = True) -> dict[str, Any]:
+    """Remove an app from the recording blacklist.
+
+    Args:
+        app: Exact name as listed by list_app_blacklist (case-insensitive
+             match against existing entries).
+        restart: If True (default), restart record so the change is live.
+    """
+    app = (app or "").strip()
+    if not app:
+        return {"error": "app must be non-empty"}
+    yaml, data = _load_config_yaml()
+    if data is None:
+        return {"error": f"{CONFIG_PATH} not found"}
+    bl = data.get("app_blacklist") or []
+    needle = app.lower()
+    new_bl = [x for x in bl if str(x).lower() != needle]
+    if len(new_bl) == len(bl):
+        return {"ok": True, "noop": True, "blacklist": list(bl),
+                "note": f"{app!r} was not in blacklist"}
+    data["app_blacklist"] = new_bl
+    _save_config_yaml(yaml, data)
+    out: dict[str, Any] = {"ok": True, "removed": app, "blacklist": list(new_bl)}
+    if restart:
+        out["restart_output"] = _restart_record()
+    return out
 
 
 if __name__ == "__main__":
