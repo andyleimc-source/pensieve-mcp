@@ -75,6 +75,60 @@ VALID_POWER_MODES = ("auto", "full_power", "forced_battery")
 mcp = FastMCP("pensieve")
 
 
+# ── error translation ────────────────────────────────────────────────────────
+
+
+def _translate_http_error(exc: Exception) -> dict[str, Any]:
+    """Map an httpx exception into an actionable MCP error dict.
+
+    Hides the raw stack trace from the LLM (which then surfaces it to the user
+    as a wall of red) and instead returns a short hint that names the likely
+    cause — pensieve down, wrong token, peer unreachable, etc.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        sc = exc.response.status_code
+        if sc == 401:
+            hint = ("Pensieve returned 401 unauthorized. Check that "
+                    "~/.config/pensieve-mcp/auth.env has the right "
+                    "PENSIEVE_TOKEN, and that all peers share the same token.")
+        elif sc == 403:
+            hint = "Pensieve returned 403 forbidden. Reverse-proxy ACL?"
+        elif sc == 404:
+            hint = ("Endpoint or entity not found. If this was a get_screenshot "
+                    "/ download_archived call, the entity may have been purged.")
+        elif 500 <= sc < 600:
+            hint = (f"Pensieve returned {sc}. The memos server is up but errored — "
+                    "check `memos logs` or `~/.memos/logs/`.")
+        else:
+            hint = f"Unexpected status {sc}."
+        return {"error": "http_status", "status": sc, "hint": hint,
+                "body": exc.response.text[:300]}
+    if isinstance(exc, httpx.ConnectError):
+        return {"error": "connect_failed",
+                "hint": ("Could not reach Pensieve at "
+                         f"{BASE}. Is `memos serve` running? Try `memos ps`."),
+                "detail": str(exc)}
+    if isinstance(exc, httpx.ReadTimeout):
+        return {"error": "timeout",
+                "hint": "Pensieve took too long to respond. Try a narrower time range or smaller limit.",
+                "detail": str(exc)}
+    return {"error": exc.__class__.__name__, "detail": str(exc)}
+
+
+def _with_http_errors(fn):
+    """Wrap an MCP tool so httpx exceptions become structured error dicts."""
+    from functools import wraps
+
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except httpx.HTTPError as exc:
+            return _translate_http_error(exc)
+
+    return wrapper
+
+
 # ── COS helpers ───────────────────────────────────────────────────────────────
 
 
@@ -341,6 +395,7 @@ def _summarize_hit(doc: dict, include_ocr: bool = True) -> dict[str, Any]:
 
 
 @mcp.tool()
+@_with_http_errors
 def search_screenshots(
     query: str,
     limit: int = 10,
@@ -416,6 +471,7 @@ def search_screenshots(
 
 
 @mcp.tool()
+@_with_http_errors
 def get_screenshot(entity_id: int, max_chars: int = 2000) -> dict[str, Any]:
     """Fetch full details for one screenshot by id.
 
@@ -465,6 +521,7 @@ def get_screenshot(entity_id: int, max_chars: int = 2000) -> dict[str, Any]:
 
 
 @mcp.tool()
+@_with_http_errors
 def download_archived(entity_id: int) -> dict[str, Any]:
     """Download an archived screenshot from COS to a local temp file.
 
@@ -544,6 +601,7 @@ def _scan_entities(s_ts: int, e_ts: int) -> list[dict]:
 
 
 @mcp.tool()
+@_with_http_errors
 def activity_summary(
     start: str | int | None = "today",
     end: str | int | None = None,
@@ -650,6 +708,46 @@ def activity_summary(
             for s, c in source_counts.most_common()
         ]
     return out
+
+
+@mcp.tool()
+@_with_http_errors
+def list_apps(
+    start: str | int | None = "last 7d",
+    end: str | int | None = None,
+    min_count: int = 1,
+    top_n: int = 100,
+) -> dict[str, Any]:
+    """List apps observed in the screen history, with shot counts.
+
+    Useful before calling `search_screenshots` or `purge_screenshots` with
+    an `app=` filter — Pensieve uses the macOS `NSApplicationName`, which
+    isn't always what the user calls the app ("Code" vs "VSCode",
+    "Cursor" vs "Cursor Helper", etc). Returns the canonical strings.
+
+    Args:
+        start: Range start. Same syntax as search_screenshots.start.
+               Defaults to "last 7d".
+        end: Range end. Ignored if `start` is symbolic.
+        min_count: Drop apps with fewer than this many shots (default 1).
+        top_n: Cap the result list (default 100).
+    """
+    s_ts, e_ts = _parse_range(start, end)
+    if s_ts is None or e_ts is None:
+        return {"error": "could not resolve time range", "start": start, "end": end}
+    docs = _scan_entities(s_ts, e_ts)
+    counts: Counter[str] = Counter()
+    for d in docs:
+        app = _meta_get(d.get("metadata_entries") or [], "active_app") or "(unknown)"
+        counts[app] += 1
+    apps = [{"app": a, "count": c} for a, c in counts.most_common(top_n)
+            if c >= int(min_count)]
+    return {
+        "time_range": {"start": s_ts, "end": e_ts},
+        "total_shots_scanned": len(docs),
+        "distinct_apps": len(counts),
+        "apps": apps,
+    }
 
 
 # ── recording pause / resume ──────────────────────────────────────────────────
@@ -842,18 +940,63 @@ def _disk_snapshot() -> dict[str, Any]:
     return out
 
 
+def _probe_peer(peer: str) -> dict[str, Any]:
+    """One-shot health probe of a peer: reachable + auth-ok + latency."""
+    import time
+    t0 = time.monotonic()
+    out: dict[str, Any] = {"peer": peer, "host": _peer_hostname(peer)}
+    try:
+        r = httpx.get(f"{peer}/api/health", timeout=5.0,
+                      trust_env=False, headers=AUTH_HEADERS)
+        out["latency_ms"] = int((time.monotonic() - t0) * 1000)
+        out["status"] = r.status_code
+        if r.status_code == 401:
+            out["reachable"] = True
+            out["auth_ok"] = False
+            out["hint"] = "peer requires a different PENSIEVE_TOKEN than this machine has"
+        elif r.status_code == 200:
+            out["reachable"] = True
+            out["auth_ok"] = True
+        else:
+            out["reachable"] = True
+            out["auth_ok"] = None
+    except Exception as e:
+        out["reachable"] = False
+        out["error"] = e.__class__.__name__
+        out["detail"] = str(e)[:200]
+    return out
+
+
 @mcp.tool()
 def health() -> dict[str, Any]:
-    """Check that the Pensieve REST API is up; report archive + disk usage."""
-    r = httpx.get(f"{BASE}/api/health", timeout=5.0, headers=AUTH_HEADERS)
-    return {
-        "status_code": r.status_code,
-        "body": r.json(),
+    """Check that the Pensieve REST API is up; report archive, disk, peers.
+
+    Always-on diagnostic. If something feels wrong (no results, slow query,
+    "did my screen get recorded today"), call this first.
+    """
+    out: dict[str, Any] = {
         "archive_configured": COS is not None,
         "archive_device": COS.get("PENSIEVE_DEVICE") if COS else None,
         "archive_bucket": COS.get("COS_BUCKET") if COS else None,
+        "auth": {
+            "token_configured": _API_TOKEN is not None,
+            "token_suffix": ("…" + _API_TOKEN[-4:]) if _API_TOKEN else None,
+            "auth_env_path": str(AUTH_ENV_PATH),
+        },
         "disk": _disk_snapshot(),
     }
+    try:
+        r = httpx.get(f"{BASE}/api/health", timeout=5.0, headers=AUTH_HEADERS)
+        out["status_code"] = r.status_code
+        out["body"] = r.json()
+    except httpx.HTTPError as e:
+        out["status_code"] = None
+        out["local_error"] = _translate_http_error(e)
+
+    if PEERS:
+        with ThreadPoolExecutor(max_workers=len(PEERS)) as ex:
+            out["peers"] = list(ex.map(_probe_peer, PEERS))
+    return out
 
 
 # ── power mode (battery throttle override) ───────────────────────────────────
@@ -978,6 +1121,7 @@ def toggle_full_power() -> dict[str, Any]:
 
 
 @mcp.tool()
+@_with_http_errors
 def purge_screenshots(
     start: str | int | None = None,
     end: str | int | None = None,

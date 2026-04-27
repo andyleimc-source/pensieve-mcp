@@ -1,5 +1,7 @@
 # pensieve-mcp
 
+[![tests](https://github.com/andyleimc-source/pensieve-mcp/actions/workflows/test.yml/badge.svg)](https://github.com/andyleimc-source/pensieve-mcp/actions/workflows/test.yml)
+
 **Apple Silicon installer + Claude Code MCP integration for [arkohut/pensieve](https://github.com/arkohut/pensieve).**
 
 Turn your Mac's screen into a searchable, local-first memory — and let Claude Code CLI query it directly.
@@ -92,8 +94,9 @@ The MCP server (`scripts/pensieve-mcp.py`) exposes these tools to Claude Code:
 | `activity_summary(start?, end?, top_apps?)` | Aggregate what you worked on in a time range — top apps, sample windows, hit count — without dumping every OCR snippet into Claude's context. |
 | `get_power_mode()` / `set_power_mode(mode)` / `toggle_full_power()` | Switch capture cadence between `eco` (slow, low CPU) and `performance` (fast, more detail). Useful when you're about to do something you really want recorded. |
 | `purge_screenshots(start, end?, app?, confirm=False)` | Retroactively delete screenshots in a time range (and their DB rows) — for redacting sensitive activity captured by accident. Dry-run by default; pass `confirm=True` to actually delete. Local machine only; not cascaded to peers. |
+| `list_apps(start?, end?, min_count?, top_n?)` | List apps observed in screen history with their shot counts. Useful before `search_screenshots(app=...)` so you don't guess the wrong NSApplicationName ("Code" vs "VSCode" etc). |
 | `list_app_blacklist()` / `add_app_blacklist(app)` / `remove_app_blacklist(app)` | Manage the recording blacklist (`app_blacklist` in `~/.memos/config.yaml`). Apps in the list are skipped at capture time. Use for password managers, banking apps, anything you never want screenshotted. Auto-restarts `record` so changes are live. |
-| `health()` | Ping the Pensieve REST API; reports archive configuration too. |
+| `health()` | Diagnostic: pings local Pensieve, probes each `PENSIEVE_PEERS` for reachability + auth + latency, reports auth-token status, archive config, disk usage with warnings. Call first when something feels off. |
 
 ### Optional: cloud archive (Tencent COS)
 
@@ -182,6 +185,17 @@ Removes the MCP registration, LaunchAgent, and (optionally) the `memos` tool. Yo
 ### Troubleshooting
 
 See [docs/troubleshooting.md](docs/troubleshooting.md). The most common issue: upstream Pensieve ships without a hard pin on `transformers`, so `uv` resolves to 5.x, which breaks `/api/search`. This kit pins it for you.
+
+### Development
+
+Pure-helper tests live in `tests/` and run on push via GitHub Actions (Python 3.11 + 3.12). To run locally:
+
+```bash
+uv run --with pytest --with httpx --with 'mcp>=1.2.0' --with psutil --with 'ruamel.yaml>=0.18' \
+  python -m pytest tests/ -v
+```
+
+Network-touching tools (`search_screenshots`, `purge_screenshots`, `health`, etc.) are not unit-tested by design — exercise them through Claude Code against a live `memos serve`.
 
 ### Credits
 
@@ -274,8 +288,9 @@ open http://localhost:8839      # Pensieve Web UI
 | `activity_summary(start?, end?, top_apps?)` | 聚合时间段内的活动概况——top apps、窗口样本、命中数——避免把每张截图的 OCR 全塞进 Claude 上下文 |
 | `get_power_mode()` / `set_power_mode(mode)` / `toggle_full_power()` | 切换截屏节奏：`eco`（慢、省电）/ `performance`（快、记得多）。要专心做某件事且希望它被完整记录时拉满 |
 | `purge_screenshots(start, end?, app?, confirm=False)` | 事后删除某段时间的截图（连 DB 行一起删），用于撤回意外被录到的敏感操作（网银、密码管理器等）。默认 dry_run，要 `confirm=True` 才真删；只作用于本机，不级联到 peer |
+| `list_apps(start?, end?, min_count?, top_n?)` | 列出屏幕历史中观察到的 app 名 + 截图数。先调它看准确字符串再 `search_screenshots(app=...)`，免得猜错 NSApplicationName（"Code" vs "VSCode"） |
 | `list_app_blacklist()` / `add_app_blacklist(app)` / `remove_app_blacklist(app)` | 管理录制黑名单（`~/.memos/config.yaml` 里的 `app_blacklist`）。黑名单里的 app 在前台时整个 tick 跳过截屏。适合密码管理器、网银、医疗等永不录制的场景。改完自动 `memos restart record` |
-| `health()` | 探活；同时报告归档功能是否启用 |
+| `health()` | 综合诊断：本机 Pensieve 探活 + 每个 `PENSIEVE_PEERS` 的可达性/auth/延迟 + token 状态 + 归档配置 + 磁盘占用（带告警）。出问题先调它 |
 
 直接对 Claude 说："暂停截屏 2 小时"、"暂停到明早 9 点"、"暂停一下"（无限期）都能识别。
 
