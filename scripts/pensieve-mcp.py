@@ -801,9 +801,50 @@ def recording_status() -> dict[str, Any]:
     return out
 
 
+def _disk_snapshot() -> dict[str, Any]:
+    """Return ~/.memos size + disk free space; flag a warning if either is bad.
+
+    Uses `du -sk` (much faster than Python's rglob+stat on large trees).
+    """
+    memos_dir = Path.home() / ".memos"
+    out: dict[str, Any] = {}
+    try:
+        proc = subprocess.run(
+            ["du", "-sk", str(memos_dir)],
+            capture_output=True, text=True, timeout=15,
+        )
+        if proc.returncode == 0:
+            kb = int(proc.stdout.split()[0])
+            out["memos_dir_bytes"] = kb * 1024
+            out["memos_dir_gb"] = round(kb / 1024 / 1024, 2)
+        else:
+            out["memos_dir_error"] = proc.stderr.strip() or "du failed"
+    except Exception as e:
+        out["memos_dir_error"] = str(e)
+    try:
+        import shutil
+        usage = shutil.disk_usage(str(memos_dir))
+        out["disk_free_bytes"] = usage.free
+        out["disk_free_gb"] = round(usage.free / 1024 / 1024 / 1024, 2)
+        out["disk_total_gb"] = round(usage.total / 1024 / 1024 / 1024, 2)
+    except Exception as e:
+        out["disk_error"] = str(e)
+
+    warnings = []
+    gb = out.get("memos_dir_gb")
+    free_gb = out.get("disk_free_gb")
+    if gb is not None and gb >= 80:
+        warnings.append(f"~/.memos at {gb}GB — emergency retention may kick in next prune")
+    if free_gb is not None and free_gb < 10:
+        warnings.append(f"only {free_gb}GB free on this volume — consider lowering RETAIN_DAYS or enabling COS archive")
+    if warnings:
+        out["warnings"] = warnings
+    return out
+
+
 @mcp.tool()
 def health() -> dict[str, Any]:
-    """Check that the Pensieve REST API is up; report archive availability too."""
+    """Check that the Pensieve REST API is up; report archive + disk usage."""
     r = httpx.get(f"{BASE}/api/health", timeout=5.0, headers=AUTH_HEADERS)
     return {
         "status_code": r.status_code,
@@ -811,6 +852,7 @@ def health() -> dict[str, Any]:
         "archive_configured": COS is not None,
         "archive_device": COS.get("PENSIEVE_DEVICE") if COS else None,
         "archive_bucket": COS.get("COS_BUCKET") if COS else None,
+        "disk": _disk_snapshot(),
     }
 
 

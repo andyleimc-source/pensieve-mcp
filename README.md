@@ -101,6 +101,27 @@ By default, screenshots older than 90 days are deleted locally. Enable cloud arc
 
 See [docs/cos-archive.md](docs/cos-archive.md) for the full setup (bucket, CAM sub-account, policy) and how it interacts with the MCP.
 
+### Optional: weekly DB backup (requires cloud archive)
+
+If cloud archive is enabled, `./install.sh` step 10 also offers to install a weekly LaunchAgent (Sunday 04:00) that uploads `~/.memos/database.db` + `config.yaml` to `cos://<bucket>/_backup/<device>/pensieve-YYYY-MM-DD.tar.gz`. Keeps the last 4 backups (rolling). Tiny — typically <100MB compressed even for years of history.
+
+Why it matters: image bytes already live in COS, but the SQLite DB (OCR text + embeddings + entity rows) and `config.yaml` are local-only. Lose them and your archive becomes unsearchable even though the .webp files survive. To restore:
+
+```bash
+coscmd download "/_backup/<device>/pensieve-2026-04-26.tar.gz" /tmp/restore.tar.gz
+tar xzf /tmp/restore.tar.gz -C /tmp/
+cp /tmp/pensieve-2026-04-26/database.db ~/.memos/database.db
+memos restart
+```
+
+Run on demand: `./scripts/backup-db.sh`.
+
+### Disk-usage safety
+
+The daily prune LaunchAgent normally honors `RETAIN_DAYS` (default 90). If `~/.memos` exceeds `EMERGENCY_GB` (default 80GB), retention temporarily drops to `EMERGENCY_RETAIN_DAYS` (default 30) so a runaway day can't fill the disk before the next 03:30 tick. `health()` also reports `~/.memos` size + free disk space and warns before either becomes critical.
+
+To tune: edit the LaunchAgent's `EnvironmentVariables` (`~/Library/LaunchAgents/com.user.pensieve.prune.plist`).
+
 ### Optional: multi-device aggregation
 
 If you run Pensieve on multiple Macs (e.g. home + work) and connect them via [Tailscale](https://tailscale.com), one MCP can transparently search across all of them. Set `PENSIEVE_PEERS` to a comma-separated list of peer base URLs (Tailscale IPs):
@@ -263,6 +284,27 @@ open http://localhost:8839      # Pensieve Web UI
 默认行为是 90 天外的截图本地直接删。在 `./install.sh` 第 6 步可以选启用云归档——超期截图先传到你私人的 COS 桶再删本地，**搜索照常工作**（OCR 文本和向量在本地 SQLite，没动），只是图片本体上云。100GB 一年 ~¥10-30。
 
 详见 [docs/cos-archive.md](docs/cos-archive.md)：建桶、CAM 子账号、最小权限策略、和 MCP 怎么联动。
+
+### 可选：DB 周备份（依赖云归档）
+
+启用了云归档之后，`./install.sh` 第 10 步会再问一次是否装周备份 LaunchAgent（每周日 04:00），把 `~/.memos/database.db` + `config.yaml` 打包传到 `cos://<bucket>/_backup/<device>/pensieve-YYYY-MM-DD.tar.gz`，保留最近 4 周。压缩后通常 <100MB，几年的历史也撑不大。
+
+为什么要单独备份 DB：图片字节已经在 COS 了，但 SQLite DB（OCR 文本 + 向量 + entity 行）和 `config.yaml` 还是纯本地——丢了的话即使 webp 还在云上，整个归档也不可搜索。恢复方法：
+
+```bash
+coscmd download "/_backup/<device>/pensieve-2026-04-26.tar.gz" /tmp/restore.tar.gz
+tar xzf /tmp/restore.tar.gz -C /tmp/
+cp /tmp/pensieve-2026-04-26/database.db ~/.memos/database.db
+memos restart
+```
+
+手动跑一次：`./scripts/backup-db.sh`。
+
+### 磁盘占用兜底
+
+每日 prune LaunchAgent 默认按 `RETAIN_DAYS`（90 天）保留。如果 `~/.memos` 超过 `EMERGENCY_GB`（默认 80GB），保留期临时降到 `EMERGENCY_RETAIN_DAYS`（默认 30），避免某个失控的白天撑爆磁盘等不到第二天 03:30。`health()` 也会报 `~/.memos` 大小和可用空间，临界前就告警。
+
+调整阈值：改 LaunchAgent plist（`~/Library/LaunchAgents/com.user.pensieve.prune.plist`）的 `EnvironmentVariables`。
 
 ### 可选：多设备聚合
 

@@ -17,15 +17,30 @@ CRED_FILE="${CRED_FILE:-${HOME}/.config/pensieve-mcp/cos.env}"
 set -a; source "${CRED_FILE}"; set +a
 
 RETAIN_DAYS="${RETAIN_DAYS:-90}"
-SHOT_DIR="${HOME}/.memos/screenshots"
-LOG="${HOME}/.memos/archive.log"
+EMERGENCY_GB="${EMERGENCY_GB:-80}"
+EMERGENCY_RETAIN_DAYS="${EMERGENCY_RETAIN_DAYS:-30}"
+MEMOS_DIR="${HOME}/.memos"
+SHOT_DIR="${MEMOS_DIR}/screenshots"
+LOG="${MEMOS_DIR}/archive.log"
 DEVICE="${PENSIEVE_DEVICE:?PENSIEVE_DEVICE must be set in cos.env}"
 COSCMD="${COSCMD:-${HOME}/.local/bin/coscmd}"
+
+# Rotate log at 10MB
+[ -f "${LOG}" ] && [ "$(wc -c <"${LOG}" 2>/dev/null || echo 0)" -gt 10485760 ] && mv "${LOG}" "${LOG}.1"
 
 ts() { date +"%Y-%m-%d %H:%M:%S"; }
 
 {
-  echo "[$(ts)] archive start (retain=${RETAIN_DAYS}d, device=${DEVICE}, bucket=${COS_BUCKET})"
+  # Emergency watermark check
+  used_mb=$(du -sm "${MEMOS_DIR}" 2>/dev/null | awk '{print $1}')
+  used_gb=$(( used_mb / 1024 ))
+  effective_retain="${RETAIN_DAYS}"
+  if [ "${used_gb}" -ge "${EMERGENCY_GB}" ]; then
+    effective_retain="${EMERGENCY_RETAIN_DAYS}"
+    echo "[$(ts)] EMERGENCY: ~/.memos at ${used_gb}GB (>= ${EMERGENCY_GB}GB), archiving anything older than ${effective_retain}d"
+  fi
+
+  echo "[$(ts)] archive start (retain=${effective_retain}d, device=${DEVICE}, bucket=${COS_BUCKET}, used=${used_gb}GB)"
   before=$(du -sh "${SHOT_DIR}" 2>/dev/null | awk '{print $1}')
 
   uploaded=0; failed=0
@@ -46,7 +61,7 @@ ts() { date +"%Y-%m-%d %H:%M:%S"; }
       echo "[$(ts)] UPLOAD-FAIL: ${f}"; cat /tmp/coscmd.out
       failed=$((failed + 1))
     fi
-  done < <(find "${SHOT_DIR}" -type f -name "*.webp" -mtime "+${RETAIN_DAYS}" -print0 2>/dev/null)
+  done < <(find "${SHOT_DIR}" -type f -name "*.webp" -mtime "+${effective_retain}" -print0 2>/dev/null)
 
   # Clean empty date subdirs (but not SHOT_DIR itself)
   find "${SHOT_DIR}" -mindepth 1 -type d -empty -delete 2>/dev/null || true

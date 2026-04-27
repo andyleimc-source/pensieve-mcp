@@ -7,6 +7,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLIST_DST="${HOME}/Library/LaunchAgents/com.user.pensieve.prune.plist"
 RESUME_PLIST="${HOME}/Library/LaunchAgents/com.user.pensieve.resume.plist"
+BACKUP_PLIST="${HOME}/Library/LaunchAgents/com.user.pensieve.backup.plist"
 PMCP_ENV_DIR="${HOME}/.config/pensieve-mcp"
 
 c_green() { printf "\033[32m%s\033[0m\n" "$*"; }
@@ -16,8 +17,8 @@ step() { printf "\n\033[1;36m==> %s\033[0m\n" "$*"; }
 step "1/6  Unregister MCP server from Claude Code"
 claude mcp remove pensieve -s user 2>/dev/null && c_green "removed" || c_yellow "not registered (skipped)"
 
-step "2/6  Unload and remove LaunchAgents (prune + resume)"
-for p in "${PLIST_DST}" "${RESUME_PLIST}"; do
+step "2/6  Unload and remove LaunchAgents (prune + resume + backup)"
+for p in "${PLIST_DST}" "${RESUME_PLIST}" "${BACKUP_PLIST}"; do
   if [[ -f "${p}" ]]; then
     launchctl unload "${p}" 2>/dev/null || true
     rm -f "${p}"

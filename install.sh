@@ -243,6 +243,38 @@ launchctl unload "${PLIST_DST}" 2>/dev/null || true
 launchctl load "${PLIST_DST}"
 c_green "ok  → ${PLIST_DST}"
 
+# ── 10b. (optional) weekly DB+config backup to COS ────────────────────────────
+BACKUP_PLIST="${HOME}/Library/LaunchAgents/com.user.pensieve.backup.plist"
+if [[ "${ARCHIVE_ENABLED}" == "yes" ]]; then
+  if [[ -f "${BACKUP_PLIST}" ]]; then
+    c_green "weekly DB backup LaunchAgent already installed — skipping"
+  else
+    cat <<EOF
+
+The screenshots themselves are now archived to COS, but ~/.memos/database.db
+(OCR text + embeddings + entity rows) and ~/.memos/config.yaml are still
+local-only. Lose them and your screen history becomes unsearchable even
+though the .webp files survive in the cloud.
+
+Optional: install a weekly LaunchAgent (Sunday 04:00) that tar.gzs the DB +
+config and uploads to cos://${COS_BUCKET:-<your-bucket>}/_backup/<device>/.
+Keeps the last 4 weeks (rolling). Tiny — typically <100MB compressed.
+EOF
+    read -r -p "Install weekly backup LaunchAgent? [y/N] " ans
+    if [[ "${ans:-}" =~ ^[Yy]$ ]]; then
+      sed \
+        -e "s|__HOME__|${HOME}|g" \
+        -e "s|__REPO__|${REPO_DIR}|g" \
+        "${REPO_DIR}/templates/com.user.pensieve.backup.plist" > "${BACKUP_PLIST}"
+      launchctl unload "${BACKUP_PLIST}" 2>/dev/null || true
+      launchctl load "${BACKUP_PLIST}"
+      c_green "ok  → ${BACKUP_PLIST}  (Sunday 04:00 weekly)"
+    else
+      c_yellow "skipped — run scripts/backup-db.sh manually anytime"
+    fi
+  fi
+fi
+
 # ── 11. register MCP server with Claude Code ──────────────────────────────────
 step "11/12  Register MCP server with Claude Code (user scope)"
 claude mcp remove pensieve -s user >/dev/null 2>&1 || true
