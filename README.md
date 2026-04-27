@@ -10,6 +10,18 @@ Turn your Mac's screen into a searchable, local-first memory — and let Claude 
 
 ## English
 
+### Features
+
+- **One-command installer** — pins the right `transformers` version so `/api/search` actually works on Apple Silicon, runs `memos init/start`, walks you through Screen Recording permission, and registers the MCP with Claude Code.
+- **Claude Code MCP integration** — ask *"what did I work on this afternoon?"* in Claude Code and it queries your local screen history directly. No external LLM key needed beyond Claude Code.
+- **Activity summary tool** — aggregate a time range into top apps + sample windows + hit count, so Claude can answer "what did I do today?" without bloating its context with raw OCR.
+- **Pause / resume capture** — tell Claude *"pause for 2 hours"* or *"pause until 9am tomorrow"*; survives sleep and reboot via launchd.
+- **Power modes** — switch capture cadence between `eco` (slow, low CPU) and `performance` (fast, more detail) on the fly.
+- **Daily retention policy** — launchd job prunes screenshots older than `RETAIN_DAYS` (default 90). Pensieve has none built in.
+- **Optional cloud archive (Tencent COS)** — instead of deleting old screenshots, upload image bytes to your private COS bucket. OCR/embeddings stay local, so search still works; ~¥1–3/month per 100GB.
+- **Optional multi-device aggregation** — set `PENSIEVE_PEERS` to your other Macs (e.g. home + work over Tailscale) and one MCP transparently searches across all of them. Results tagged with `source=<hostname>`.
+- **Optional Bearer-token auth** — drop a token into `~/.config/pensieve-mcp/auth.env` to authenticate every request to local Pensieve and to peers. Required if you expose `:8839` to a LAN or Tailnet.
+
 ### What is this?
 
 [Pensieve](https://github.com/arkohut/pensieve) (the `memos` CLI) is an open-source, local-first screen-memory tool: it takes screenshots every few seconds, OCRs them, embeds them, and lets you search your screen history offline.
@@ -135,6 +147,18 @@ License: MIT.
 ---
 
 ## 中文
+
+### 主要特性
+
+- **一键安装**：pin 住 `transformers` 版本（不 pin 上游会装到 5.x 把 `/api/search` 搞挂），自动跑 `memos init/start`，引导授权"屏幕录制"，注册 MCP 到 Claude Code
+- **Claude Code MCP 集成**：在 Claude Code 里直接问"我下午都在干嘛"，它会查你本地的屏幕历史回答。**不需要额外 API key**，用你订阅里的 Claude 即可
+- **活动汇总工具**：`activity_summary` 把时间段聚合成 top apps + 窗口样本 + 命中数，让 Claude 答"今天我都干了啥"时不会被海量 OCR 撑爆上下文
+- **暂停 / 恢复截屏**：直接对 Claude 说"暂停 2 小时""暂停到明早 9 点""暂停一下"都行；通过 launchd 实现，睡眠 / 重启都能正常恢复
+- **电源模式切换**：`eco`（慢、省电）和 `performance`（快、记得多）随时切，要专心做某件事且希望被完整记录就拉满
+- **每日保留策略**：launchd 每天凌晨清理 `RETAIN_DAYS`（默认 90）天外的截图。Pensieve 官方没有这功能
+- **可选云归档（腾讯云 COS）**：超期截图不直接删，传到你私人 COS 桶，OCR 文本和向量留在本地——**搜索照常工作**，只是图片本体上云。100GB 一年 ~¥10-30
+- **可选多设备聚合**：`PENSIEVE_PEERS` 配上其他 Mac（比如家 + 公司，Tailscale 互通），一个 MCP 就能跨设备透明搜索，结果带 `source=<hostname>` 标签
+- **可选 Bearer token 鉴权**：把 token 放进 `~/.config/pensieve-mcp/auth.env`，所有调本地 Pensieve 和 peer 的请求都自动带 `Authorization` 头。把 `:8839` 暴露到 LAN/Tailnet 时**必须**配
 
 ### 这是什么？
 
