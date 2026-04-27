@@ -558,17 +558,18 @@ def activity_summary(
                to "today". Symbolic ranges ("today afternoon", "yesterday",
                "last 7d") fill in the end automatically.
         end: Range end. Ignored if `start` is symbolic.
-        group_by: "app" | "window" | "hour" | "all"
+        group_by: "app" | "window" | "hour" | "source" | "all"
                   - "app":    top apps by screenshot count
                   - "window": top window titles
                   - "hour":   per-hour bucket with top app
-                  - "all":    apps + windows + hourly
+                  - "source": per-device counts (local + each peer)
+                  - "all":    apps + windows + hourly + by_source
         top_n: How many top apps/windows to return (default 10, max 50).
     """
     top_n = max(1, min(int(top_n), 50))
-    if group_by not in ("app", "window", "hour", "all"):
+    if group_by not in ("app", "window", "hour", "source", "all"):
         return {"error": f"invalid group_by: {group_by!r}",
-                "valid": ["app", "window", "hour", "all"]}
+                "valid": ["app", "window", "hour", "source", "all"]}
 
     s_ts, e_ts = _parse_range(start, end)
     if s_ts is None or e_ts is None:
@@ -590,14 +591,19 @@ def activity_summary(
 
     app_counts: Counter[str] = Counter()
     window_counts: Counter[str] = Counter()
+    source_counts: Counter[str] = Counter()
+    source_app: dict[str, Counter[str]] = {}
     hourly: dict[str, Counter[str]] = {}
 
     for doc in docs:
         meta = doc.get("metadata_entries") or []
         app = _meta_get(meta, "active_app") or "(unknown)"
         win = _meta_get(meta, "active_window") or "(unknown)"
+        src = doc.get("_source") or "local"
         app_counts[app] += 1
         window_counts[win] += 1
+        source_counts[src] += 1
+        source_app.setdefault(src, Counter())[app] += 1
         ts = doc.get("file_created_at")
         if ts:
             try:
@@ -631,6 +637,15 @@ def activity_summary(
                 "top_app": c.most_common(1)[0][0] if c else None,
             }
             for h, c in sorted(hourly.items())
+        ]
+    if group_by in ("source", "all"):
+        out["by_source"] = [
+            {
+                "source": s,
+                "count": c,
+                "top_app": source_app[s].most_common(1)[0][0] if source_app.get(s) else None,
+            }
+            for s, c in source_counts.most_common()
         ]
     return out
 
