@@ -30,13 +30,35 @@ if [[ "$(uname -m)" != "arm64" ]]; then
 fi
 need uv     "brew install uv    — https://docs.astral.sh/uv/"
 need claude "https://docs.anthropic.com/claude-code  (install Claude Code CLI)"
+need git    "brew install git"
+need node   "brew install node  (Node.js 22+ required for web-react build)"
+need npm    "brew install node  (npm comes with node)"
 command -v curl >/dev/null 2>&1 || { c_red "curl missing"; exit 1; }
 c_green "ok"
 
-# ── 2. install memos with transformers<5 pin (critical) ───────────────────────
-step "2/12  Install Pensieve (memos) via uv, pinned to transformers<5"
-# transformers 5.x removed transformers.onnx, which pensieve still imports.
-uv tool install memos --with "transformers<5" --force
+# ── 2. clone + build fork, then install memos from local source ───────────────
+# Why a fork instead of PyPI:
+#   - upstream arkohut/pensieve PyPI releases (≥0.32) ship breaking changes
+#     (alembic add_library_kind migration is destructive; structured_vlm
+#     plugin has missing prompt_v1.txt; hybrid_search has arg-mismatch bugs).
+#   - andyleimc-source/pensieve is a pinned fork at 0.31.0 + web→react
+#     migration + a few small fixes (vlm/watch death-loop, OCR lang).
+#     This is the version actually proven on Andy's three Macs.
+# Why transformers<5: v5 removed `transformers.onnx`, which the jina
+# embedding model's remote code still imports → 500 on every search.
+step "2/12  Clone fork, build web assets, install memos via uv"
+FORK_DIR="${HOME}/.local/share/pensieve-fork"
+if [[ ! -d "${FORK_DIR}/.git" ]]; then
+  c_yellow "Cloning andyleimc-source/pensieve → ${FORK_DIR}"
+  git clone --depth 1 -b master https://github.com/andyleimc-source/pensieve.git "${FORK_DIR}"
+else
+  c_yellow "Fork already cloned — pulling latest"
+  (cd "${FORK_DIR}" && git pull --ff-only)
+fi
+c_yellow "Building React web assets (vite)"
+(cd "${FORK_DIR}/web" && npm install --no-audit --no-fund && npm run build)
+c_yellow "Installing memos from ${FORK_DIR}"
+uv tool install --from "${FORK_DIR}" memos --with "transformers<5" --force
 c_green "ok"
 
 # ── 3. apply patches to memos site-packages ───────────────────────────────────
@@ -149,12 +171,25 @@ EOF
 fi
 c_green "ok"
 
-# ── 8. start memos ────────────────────────────────────────────────────────────
-step "8/12  Start memos services (serve + record + watch)"
+# ── 8. install LaunchAgents for memos watch/record + start memos ──────────────
+step "8/12  Install memos watch/record LaunchAgents (auto-start on login) + start memos"
+# Why LaunchAgents: `memos start` only runs in the current shell; on next
+# login record/watch are gone. LaunchAgents give us auto-restart + autostart.
+# The PATH must include /usr/sbin so `system_profiler` is reachable by
+# record.py (see bug.md 2026-04-27).
+mkdir -p "${HOME}/Library/LaunchAgents"
+for svc in watch record; do
+  src="${REPO_DIR}/templates/com.user.memos.${svc}.plist"
+  dst="${HOME}/Library/LaunchAgents/com.user.memos.${svc}.plist"
+  sed "s|__HOME__|${HOME}|g" "${src}" > "${dst}"
+  launchctl unload "${dst}" 2>/dev/null || true
+  launchctl load "${dst}"
+  c_green "  loaded com.user.memos.${svc}"
+done
 # Source HF_ENDPOINT if installer set one — protects re-runs / future restarts
 # in shells where the user hasn't exported it.
 [[ -f "${HF_ENV_FILE}" ]] && source "${HF_ENV_FILE}"
-memos start || true
+memos start serve || true
 printf "Waiting for REST API"
 for _ in $(seq 1 15); do
   code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8839/api/health" || true)

@@ -59,11 +59,13 @@ cd pensieve-mcp
 ```
 
 The installer will:
-1. Install `memos` via `uv tool install memos --with "transformers<5"`
-2. Run `memos init` and `memos start`
+1. Clone the `andyleimc-source/pensieve` fork to `~/.local/share/pensieve-fork`, build its React web assets (`npm run build`), and install memos from that source via `uv tool install --from <fork> memos --with "transformers<5"` (PyPI ≥0.32 has destructive migration + plugin packaging bugs; the fork is pinned to a working 0.31.0 + web-react + small fixes)
+2. Run `memos init` and install `com.user.memos.{watch,record}` LaunchAgents (auto-start on login, PATH includes /usr/sbin so `system_profiler` is reachable from `memos record`)
 3. Open System Settings for you to grant Screen Recording permission
 4. Install a daily LaunchAgent that prunes screenshots older than `RETAIN_DAYS` (default 90)
 5. Register the MCP server with Claude Code (user scope)
+
+Prerequisites: `uv`, `git`, `node` (22+) — `brew install uv git node`.
 
 To change retention: `RETAIN_DAYS=30 ./install.sh`.
 
@@ -161,11 +163,14 @@ For multi-device, write the **same** token to `auth.env` on every machine. Misma
 
 ### Upgrading
 
-When upstream Pensieve releases a new version:
+When the fork repo (`andyleimc-source/pensieve`) gets new commits:
 
 ```bash
 memos stop
-uv tool upgrade memos --with "transformers<5"
+FORK_DIR="${HOME}/.local/share/pensieve-fork"
+(cd "${FORK_DIR}" && git pull --ff-only)
+(cd "${FORK_DIR}/web" && npm install --no-audit --no-fund && npm run build)
+uv tool install --from "${FORK_DIR}" memos --with "transformers<5" --force
 ./scripts/apply-patches.sh        # re-apply the three site-packages patches
 memos start
 ```
@@ -255,11 +260,13 @@ cd pensieve-mcp
 ```
 
 脚本会：
-1. `uv tool install memos --with "transformers<5"` 装好 Pensieve（带正确 pin）
-2. `memos init` + `memos start`
+1. clone fork（`andyleimc-source/pensieve`）到 `~/.local/share/pensieve-fork`，跑 `npm run build` 编译 React 前端，再 `uv tool install --from <fork> memos --with "transformers<5"` 装好 Pensieve（PyPI ≥0.32 有破坏性迁移 + plugin 打包缺文件，fork 锁在能跑通的 0.31.0+web-react+若干修复）
+2. `memos init`，装 `com.user.memos.{watch,record}` 两个 LaunchAgent（开机自启 + 自愈，PATH 含 /usr/sbin 确保 `memos record` 能调到 `system_profiler`）
 3. 帮你打开"系统设置→隐私与安全性→屏幕录制"去授权
 4. 装一个每天凌晨跑的 LaunchAgent，清理 `RETAIN_DAYS`（默认 90）天外的截图
 5. 把 MCP server 注册到 Claude Code（user scope）
+
+依赖：`uv`、`git`、`node`（22+），`brew install uv git node`。
 
 要改保留天数：`RETAIN_DAYS=30 ./install.sh`。
 
@@ -357,16 +364,19 @@ memos stop && memos start    # server.py middleware 在启动时读 auth.env
 
 ### 升级
 
-上游 Pensieve 发新版时：
+fork 仓库（`andyleimc-source/pensieve`）有新 commit 时：
 
 ```bash
 memos stop
-uv tool upgrade memos --with "transformers<5"
+FORK_DIR="${HOME}/.local/share/pensieve-fork"
+(cd "${FORK_DIR}" && git pull --ff-only)
+(cd "${FORK_DIR}/web" && npm install --no-audit --no-fund && npm run build)
+uv tool install --from "${FORK_DIR}" memos --with "transformers<5" --force
 ./scripts/apply-patches.sh        # 重新打三个 site-packages patch
 memos start
 ```
 
-`uv tool upgrade` / `uv tool install --force` 会清掉 site-packages，把鉴权 middleware、电源模式 override、镜像显示器过滤一并吹飞。`apply-patches.sh` 幂等，并且会探测上游飘移——升级后某个 patch apply 失败请开 issue。
+`uv tool install --force` 会清掉 site-packages，把鉴权 middleware、电源模式 override、镜像显示器过滤一并吹飞。`apply-patches.sh` 幂等，并且会探测上游飘移——升级后某个 patch apply 失败请开 issue。
 
 随时检查状态：`./scripts/apply-patches.sh --check`。
 
